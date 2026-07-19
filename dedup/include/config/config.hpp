@@ -62,6 +62,7 @@ enum class ChunkingTech {
     AE,
     GEAR,
     FASTCDC,
+    SUPERCDC,
     MAXP,
     RAM,
     EXPERIMENT,
@@ -211,6 +212,8 @@ class Config {
      * @return gear desired avg block size
      */
     uint64_t get_gear_max_block_size() const;
+
+    uint64_t get_sscdc_optimization_level() const;
 
     /**
      * @brief Get the desired minimum size of the block when using FASTCDC

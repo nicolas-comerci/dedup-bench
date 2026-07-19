@@ -25,6 +25,7 @@
 
 #include "ae_chunking.hpp"
 #include "fastcdc.hpp"
+#include "supercdc.hpp"
 #include "fixed_chunking.hpp"
 #include "gear_chunking.hpp"
 #include "rabins_chunking.hpp"
@@ -173,8 +174,11 @@ int main(int argc, char* argv[]) {
                 chunk_method = std::make_unique<Gear_Chunking>(config);
                 break;
             case ChunkingTech::FASTCDC:
-                chunk_method = std::make_unique<FastCDC>(config);
-                break;
+              chunk_method = std::make_unique<FastCDC>(config);
+              break;
+            case ChunkingTech::SUPERCDC:
+              chunk_method = std::make_unique<SuperCDC>(config);
+              break;
             case ChunkingTech::RAM:
                 chunk_method = std::make_unique<RAM_Chunking>(config);
                 break;

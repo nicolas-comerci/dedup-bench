@@ -42,3 +42,5 @@ results_*.txt
 results_graph.png
 build/random_dataset/
 build/hashes_*
+.vs/
+.idea/

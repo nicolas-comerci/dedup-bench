@@ -4,6 +4,11 @@
 #include "chunking_common.hpp"
 #include "config.hpp"
 
+struct chunk_boundary {
+  uint64_t left;
+  uint64_t right;
+};
+
 class Gear_Chunking : public virtual Chunking_Technique {
     /**
      * @brief Class implementing gear's based chunking
@@ -15,7 +20,13 @@ class Gear_Chunking : public virtual Chunking_Technique {
     uint64_t max_block_size;
     uint64_t avg_block_size;
     uint64_t mask;
+    SIMD_Mode simd_mode;
 
+    // for ss-cdc
+    uint64_t file_size;
+    uint8_t* cutpoint_bitmap = nullptr;
+    chunk_boundary cb{};
+    uint64_t optimization_level;
 
 
     const uint64_t GEAR_TABLE[256] = {
@@ -123,6 +134,9 @@ class Gear_Chunking : public virtual Chunking_Technique {
      */
     uint64_t find_cutpoint(char* buff, uint64_t size) override;
 
+    uint64_t find_cutpoint_serial(char* buff, uint64_t size);
+    uint64_t find_cutpoint_avx512(char* buff, uint64_t size);
+
 
    public:
     /**
@@ -142,7 +156,7 @@ class Gear_Chunking : public virtual Chunking_Technique {
      * @param data Data stream to chunk.
      * @return A vector of File_Chuncks
      */
-    std::vector<File_Chunk> chunk_file(std::string file_path);
+    std::vector<std::string> chunk_file(std::string file_path) override;
 };
 
 #endif

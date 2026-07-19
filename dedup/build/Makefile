@@ -50,7 +50,8 @@ DEPS_CONFIG = $(wildcard $(INCLUDE_PATH_CONFIG)/*.hpp)
 
 # 	For everything except AVX-512, pass '-msse -msse2 -msse3 -msse4.1 -mavx -mavx2 -mbmi -mbmi2' as EXTRA_COMPILER_FLAGS
 
-COMPILER_FLAGS= -std=c++17 -Wall -Wextra -Wno-format -O3 -Wno-implicit-fallthrough ${EXTRA_COMPILER_FLAGS}
+COMPILER_FLAGS= -std=c++17 -Wall -Wextra -Wno-format -O3 -DNDEBUG -Wno-implicit-fallthrough ${EXTRA_COMPILER_FLAGS}
+#COMPILER_FLAGS= -std=c++17 -Wall -Wextra -Wno-format -g -Wno-implicit-fallthrough ${EXTRA_COMPILER_FLAGS}
 
 CC = g++
 RM = rm -f

@@ -78,7 +78,7 @@ class Chunking_Technique{
          * @param file_path: String containing path to file
          * @return: Vector of struct File_Chunk
          */
-        std::vector<std::string> chunk_file(std::string file_path);
+        virtual std::vector<std::string> chunk_file(std::string file_path);
         /**
          * @brief Chunk a stream using a chunking technique and append the struct File_Chunks from this operation
          * to the vector passed in

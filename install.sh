@@ -65,7 +65,22 @@ do
 
 done
 
-echo -e "\nBuild completed. Creating random dataset..."
+while true; do
+    read -p "Build completed. Do you want to (re)create the random dataset? Y/N: " YN_CHOICE
+    case "$YN_CHOICE" in
+        [yY] | [yY][eE][sS])
+            break
+            ;;
+        [nN] | [nN][oO])
+            exit 0
+            ;;
+        *)
+            echo "Please choose Y for yes, N for no.\n"
+            ;;
+    esac
+done
+
+echo -e "\nCreating random dataset..."
 
 # Create random dataset
 rm -rf random_dataset

@@ -6,7 +6,8 @@
 
 class FastCDC : public virtual Chunking_Technique {
     /**
-     * @brief Class implementing gear's based chunking
+     * @brief Class implementing FastCDC: gear's based chunking with
+     * subminimum skipping and normalized chunking.
      *
      */
 

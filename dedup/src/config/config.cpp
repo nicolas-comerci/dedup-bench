@@ -21,6 +21,8 @@ ChunkingTech Config::get_chunking_tech() const {
             return ChunkingTech::GEAR;
         } else if (value == "fastcdc") {
             return ChunkingTech::FASTCDC;
+        } else if (value == "supercdc") {
+          return ChunkingTech::SUPERCDC;
         } else if (value == "ram") {
             return ChunkingTech::RAM;
         } else if(value == "maxp"){
@@ -211,6 +213,22 @@ uint64_t Config::get_gear_max_block_size() const {
     throw ConfigError(
         "The configuration file does not specify a valid gear maximum block "
         "size for gear hash");
+}
+
+uint64_t Config::get_sscdc_optimization_level() const {
+    std::string value{};
+    try {
+        value = parser.get_property("optimization_level");
+    } catch (...) {
+        return 0;
+    }
+    try {
+        return !value.empty() ? std::stoull(value) : 0;
+    } catch (...) {
+    }
+    throw ConfigError(
+        "The configuration file does not specify a valid sscdc optimization "
+        "level");
 }
 
 uint64_t Config::get_gear_avg_block_size() const {

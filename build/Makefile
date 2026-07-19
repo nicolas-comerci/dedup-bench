@@ -35,15 +35,15 @@ all:
 
 .PHONY: sse128
 sse128:
-	$(MAKE) EXTRA_COMPILER_FLAGS="-msse -msse2 -msse3 -msse4.1" all
+	$(MAKE) -B EXTRA_COMPILER_FLAGS="-msse -msse2 -msse3 -msse4.1" all
 	
 .PHONY: avx256
 avx256:
-	$(MAKE) EXTRA_COMPILER_FLAGS="-mavx -mavx2" all
+	$(MAKE) -B EXTRA_COMPILER_FLAGS="-mavx -mavx2" all
 
 .PHONY: avx512
 avx512:
-	$(MAKE) EXTRA_COMPILER_FLAGS="-mavx512f -mavx512vl -mavx512bw" all
+	$(MAKE) -B EXTRA_COMPILER_FLAGS="-mavx512f -mavx512vl -mavx512bw" all
 
 .PHONY: arm_neon128
 arm_neon128:
@@ -55,11 +55,11 @@ ibm_altivec128:
 
 .PHONY: simd_all
 simd_all:
-	$(MAKE) EXTRA_COMPILER_FLAGS="-msse -msse2 -msse3 -msse4.1 -mavx -mavx2 -mbmi -mbmi2" all
+	$(MAKE) -B EXTRA_COMPILER_FLAGS="-msse -msse2 -msse3 -msse4.1 -mavx -mavx2 -mbmi -mbmi2" all
 	
 .PHONY: simd512_all
 simd512_all:
-	$(MAKE) EXTRA_COMPILER_FLAGS="-msse -msse2 -msse3 -msse4.1 -mavx -mavx2 -mbmi -mbmi2 -mavx512f -mavx512vl -mavx512bw" all
+	$(MAKE) -B EXTRA_COMPILER_FLAGS="-msse -msse2 -msse3 -msse4.1 -mavx -mavx2 -mbmi -mbmi2 -mavx512f -mavx512vl -mavx512bw" all
 	
 .PHONY: clean
 clean:

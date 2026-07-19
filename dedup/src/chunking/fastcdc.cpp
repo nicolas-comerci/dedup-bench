@@ -1,7 +1,7 @@
 /**
- * @file gear_chunking.cpp
+ * @file fastcdc.cpp
  * @author WASL
- * @brief Implementations for gear chunking technique
+ * @brief Implementations for FastCDC chunking technique
  * @version 0.1
  * @date 2023-4-1
  *
