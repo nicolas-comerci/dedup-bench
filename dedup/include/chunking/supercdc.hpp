@@ -1,13 +1,13 @@
-#ifndef _FastCDC_CHUNKING_
-#define _FastCDC_CHUNKING_
+#ifndef _SuperCDC_CHUNKING_
+#define _SuperCDC_CHUNKING_
 
 #include "chunking_common.hpp"
 #include "config.hpp"
 
-class FastCDC : public virtual Chunking_Technique {
+class SuperCDC : public virtual Chunking_Technique {
     /**
-     * @brief Class implementing FastCDC: gear's based chunking with
-     * subminimum skipping and normalized chunking.
+     * @brief Class (partially) implementing SuperCDC: FastCDC + backup cut condition.
+     * Memory recorder speed optimization not yet implemented.
      *
      */
 
@@ -19,6 +19,7 @@ class FastCDC : public virtual Chunking_Technique {
 
     uint64_t small_mask;
     uint64_t large_mask;
+    uint64_t backup_mask;
 
     /**
      * @brief finds the next cut point in an array of bytes
@@ -121,15 +122,15 @@ class FastCDC : public virtual Chunking_Technique {
      * @brief Default constructor. defines all parameters to defualt values
      * @return: void
      */
-    FastCDC();
+    SuperCDC();
 
     /**
      * @brief Defines all parameters based on values from the config file
      * @return: void
      */
-    FastCDC(const Config& config);
+    SuperCDC(const Config& config);
 
-    ~FastCDC();
+    ~SuperCDC();
 };
 
 #endif

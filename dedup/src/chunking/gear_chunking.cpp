@@ -17,6 +17,12 @@
 #include <iostream>
 #include <memory>
 
+#include <immintrin.h>
+
+#include "compiler_compat.hpp"
+
+extern bool disable_hashing;
+
 Gear_Chunking::Gear_Chunking(const Config& config) {
     min_block_size = config.get_gear_min_block_size();
     max_block_size = config.get_gear_max_block_size();
@@ -34,29 +40,854 @@ Gear_Chunking::Gear_Chunking(const Config& config) {
         }
         mask = mask << 1;
     }
+
+    simd_mode = config.get_simd_mode();
+	optimization_level = config.get_sscdc_optimization_level();
 }
 
 uint64_t Gear_Chunking::ghash(uint64_t h, unsigned char ch) {
     return ((h << 1) + GEAR_TABLE[ch]);
 }
 
-uint64_t Gear_Chunking::find_cutpoint(char* data, uint64_t size) {
-    uint64_t hash = 0;
-    uint64_t idx = min_block_size;
+alignas(16) static const uint32_t crct[256] =
+{
+	0x00000000,0x77073096,0xEE0E612C,0x990951BA,0x076DC419,0x706AF48F,0xE963A535,0x9E6495A3,
+	0x0EDB8832,0x79DCB8A4,0xE0D5E91E,0x97D2D988,0x09B64C2B,0x7EB17CBD,0xE7B82D07,0x90BF1D91,
+	0x1DB71064,0x6AB020F2,0xF3B97148,0x84BE41DE,0x1ADAD47D,0x6DDDE4EB,0xF4D4B551,0x83D385C7,
+	0x136C9856,0x646BA8C0,0xFD62F97A,0x8A65C9EC,0x14015C4F,0x63066CD9,0xFA0F3D63,0x8D080DF5,
+	0x3B6E20C8,0x4C69105E,0xD56041E4,0xA2677172,0x3C03E4D1,0x4B04D447,0xD20D85FD,0xA50AB56B,
+	0x35B5A8FA,0x42B2986C,0xDBBBC9D6,0xACBCF940,0x32D86CE3,0x45DF5C75,0xDCD60DCF,0xABD13D59,
+	0x26D930AC,0x51DE003A,0xC8D75180,0xBFD06116,0x21B4F4B5,0x56B3C423,0xCFBA9599,0xB8BDA50F,
+	0x2802B89E,0x5F058808,0xC60CD9B2,0xB10BE924,0x2F6F7C87,0x58684C11,0xC1611DAB,0xB6662D3D,
+	0x76DC4190,0x01DB7106,0x98D220BC,0xEFD5102A,0x71B18589,0x06B6B51F,0x9FBFE4A5,0xE8B8D433,
+	0x7807C9A2,0x0F00F934,0x9609A88E,0xE10E9818,0x7F6A0DBB,0x086D3D2D,0x91646C97,0xE6635C01,
+	0x6B6B51F4,0x1C6C6162,0x856530D8,0xF262004E,0x6C0695ED,0x1B01A57B,0x8208F4C1,0xF50FC457,
+	0x65B0D9C6,0x12B7E950,0x8BBEB8EA,0xFCB9887C,0x62DD1DDF,0x15DA2D49,0x8CD37CF3,0xFBD44C65,
+	0x4DB26158,0x3AB551CE,0xA3BC0074,0xD4BB30E2,0x4ADFA541,0x3DD895D7,0xA4D1C46D,0xD3D6F4FB,
+	0x4369E96A,0x346ED9FC,0xAD678846,0xDA60B8D0,0x44042D73,0x33031DE5,0xAA0A4C5F,0xDD0D7CC9,
+	0x5005713C,0x270241AA,0xBE0B1010,0xC90C2086,0x5768B525,0x206F85B3,0xB966D409,0xCE61E49F,
+	0x5EDEF90E,0x29D9C998,0xB0D09822,0xC7D7A8B4,0x59B33D17,0x2EB40D81,0xB7BD5C3B,0xC0BA6CAD,
+	0xEDB88320,0x9ABFB3B6,0x03B6E20C,0x74B1D29A,0xEAD54739,0x9DD277AF,0x04DB2615,0x73DC1683,
+	0xE3630B12,0x94643B84,0x0D6D6A3E,0x7A6A5AA8,0xE40ECF0B,0x9309FF9D,0x0A00AE27,0x7D079EB1,
+	0xF00F9344,0x8708A3D2,0x1E01F268,0x6906C2FE,0xF762575D,0x806567CB,0x196C3671,0x6E6B06E7,
+	0xFED41B76,0x89D32BE0,0x10DA7A5A,0x67DD4ACC,0xF9B9DF6F,0x8EBEEFF9,0x17B7BE43,0x60B08ED5,
+	0xD6D6A3E8,0xA1D1937E,0x38D8C2C4,0x4FDFF252,0xD1BB67F1,0xA6BC5767,0x3FB506DD,0x48B2364B,
+	0xD80D2BDA,0xAF0A1B4C,0x36034AF6,0x41047A60,0xDF60EFC3,0xA867DF55,0x316E8EEF,0x4669BE79,
+	0xCB61B38C,0xBC66831A,0x256FD2A0,0x5268E236,0xCC0C7795,0xBB0B4703,0x220216B9,0x5505262F,
+	0xC5BA3BBE,0xB2BD0B28,0x2BB45A92,0x5CB36A04,0xC2D7FFA7,0xB5D0CF31,0x2CD99E8B,0x5BDEAE1D,
+	0x9B64C2B0,0xEC63F226,0x756AA39C,0x026D930A,0x9C0906A9,0xEB0E363F,0x72076785,0x05005713,
+	0x95BF4A82,0xE2B87A14,0x7BB12BAE,0x0CB61B38,0x92D28E9B,0xE5D5BE0D,0x7CDCEFB7,0x0BDBDF21,
+	0x86D3D2D4,0xF1D4E242,0x68DDB3F8,0x1FDA836E,0x81BE16CD,0xF6B9265B,0x6FB077E1,0x18B74777,
+	0x88085AE6,0xFF0F6A70,0x66063BCA,0x11010B5C,0x8F659EFF,0xF862AE69,0x616BFFD3,0x166CCF45,
+	0xA00AE278,0xD70DD2EE,0x4E048354,0x3903B3C2,0xA7672661,0xD06016F7,0x4969474D,0x3E6E77DB,
+	0xAED16A4A,0xD9D65ADC,0x40DF0B66,0x37D83BF0,0xA9BCAE53,0xDEBB9EC5,0x47B2CF7F,0x30B5FFE9,
+	0xBDBDF21C,0xCABAC28A,0x53B39330,0x24B4A3A6,0xBAD03605,0xCDD70693,0x54DE5729,0x23D967BF,
+	0xB3667A2E,0xC4614AB8,0x5D681B02,0x2A6F2B94,0xB40BBE37,0xC30C8EA1,0x5A05DF1B,0x2D02EF8D,
+};
 
-    // If given data is lower than the minimum chunk size, return data length.
-    if (size <= min_block_size) {
-        return size;
-    }
-
-    while (idx < size && idx < max_block_size) {
-        hash = ghash(hash, data[idx]);
-        if (!(hash & mask)) {
-            return idx;
-        }
-        idx += 1;
-    }
-
-    return idx;
+static inline void doGear_serial(uint8_t c, uint32_t* x) {
+	*x = (*x << 1) + crct[c];
 }
 
+#ifndef _MSC_VER
+#define vector_idx(table, idx) \
+	((__v16si)table)[idx]
+#else
+#define vector_idx(table, idx) \
+	table.m512i_i32[idx]
+#endif
+#define HASHLEN 256
+#define GEAR_HASHLEN 32
+
+inline void* portable_aligned_alloc(std::size_t alignment, std::size_t size) {
+#ifdef _WIN32
+	return _aligned_malloc(size, alignment);
+#elif defined(__APPLE__) || defined(__MACH__)
+	// macOS: posix_memalign is safest
+	void* ptr = nullptr;
+	if (posix_memalign(&ptr, alignment, size) != 0) {
+		return nullptr;
+	}
+	return ptr;
+#else
+	// Linux and others with C11 support
+	return std::aligned_alloc(alignment, size);
+#endif
+}
+
+inline void portable_aligned_free(void* ptr) {
+#ifdef _WIN32
+	_aligned_free(ptr);
+#else
+	std::free(ptr);
+#endif
+}
+
+// Precondition: cutpoint_bitmap is allocated with at least (file_size / 8) (+1 if not divisible) bytes
+// Serial version of SS-CDC phase one to have a simpler, slower but correct implementation for reference
+static void sscdc_chunking_phase_one_serial_gear(uint32_t mask, uint64_t min_block_size, unsigned char* RESTRICT file_data, uint64_t file_size, uint8_t* RESTRICT cutpoint_bitmap) {
+	uint64_t curr_pos = 0;
+	uint32_t hash = 0;
+	for (; curr_pos < GEAR_HASHLEN; curr_pos++) {
+		hash = (hash << 1) + crct[file_data[curr_pos]];
+	}
+	for (; curr_pos < file_size; curr_pos++) {
+		hash = (hash << 1) + crct[file_data[curr_pos]];
+		if (!(hash & mask)) {
+			uint8_t bits = cutpoint_bitmap[curr_pos / 8];  // get bits for block of 8 bytes
+			bits |= 1 << (curr_pos % 8);  // set appropriate bit
+			cutpoint_bitmap[curr_pos / 8] = bits;  // overwrite byte in bitmap with newly set bit
+			//printf("Serial: offset %d hash %x\n", offset, hash);
+		}
+	}
+}
+
+#if defined(__AVX512F__)
+#define doGearAvx512(hash, cbytes) {\
+					hash = _mm512_slli_epi32(hash, 1);\
+					__m512i idx = _mm512_and_epi32(cbytes, cmask);\
+					cbytes = _mm512_srli_epi32(cbytes, 8);\
+					__m512i tentry = _mm512_i32gather_epi32(idx, crct, 4);\
+					hash = _mm512_add_epi32(hash, tentry);}
+
+// Code adapted from NetApp's SSCDC repo
+// Precondition: cutpoint_bitmap is allocated with at least (file_size / 8) (+1 if not divisible) bytes (ideally aligned to 64bytes=512bits)
+static void sscdc_chunking_phase_one_avx512_gear(uint32_t mask, uint64_t min_block_size, const unsigned char* RESTRICT file_data, uint64_t file_size, uint8_t* RESTRICT cutpoint_bitmap) {
+	static constexpr uint32_t LANE_COUNT = 16;
+	const __m512i mm_break_mark = _mm512_set1_epi32(mask);
+	const __m512i cmask = _mm512_set1_epi32(0xff);
+	uint64_t file_data_offset = 0;
+	uint64_t total_bytes_left = file_size;
+
+	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {  // if bytes left are too few just complete the remainder with serial version
+		// Ensure the window offsets don't overflow (2GB, max i32 value)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// SS-CDC would only need GEAR_HASHLEN - 1 of overlap between lane/thread segments, but we just use GEAR_HASHLEN as its easier.
+		// Also ensure each lane has a even number of GEAR_HASHLEN bytes sets of data to roll GEAR to.
+		// We do this so when we scatter the bitmap results we do it efficiently.
+		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
+		// Add GEAR_HASHLEN overlap and we still have an even number of GEAR_HASHLEN bytes=8 Gather instructions
+		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
+		// Readjust window_bytes as it might now be a few bytes smaller because of divisibility
+		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
+
+		__m512i vindex = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+		// bytes_per_lane_without_overlap used for each lane's start pos, lanes overlap at the end of their data into next lane's data.
+		// This applies even for the last lane, the next iteration will start at the start of the last lane's overlap data.
+		vindex = _mm512_mullo_epi32(vindex, _mm512_set1_epi32(bytes_per_lane_without_overlap));
+
+		const auto zero_vec = _mm512_set1_epi32(0);
+
+		__m512i hash = zero_vec;
+		__m512i cutpoint_bitmap_vmask = zero_vec;
+		// We know exactly how many Gathers we will need to process all data in the window as each Gather gets 32bits/4bytes of data
+		// per lane, and bytes_per_lane is divisible by GEAR_HASHLEN=8 Gather instructions.
+		const unsigned int gather_count = (bytes_per_lane / GEAR_HASHLEN) * 8;
+		// First do the "warmup" so each lane gets the valid GEAR hash pattern after the overlap with the previous lane's data
+		// ( for the first lane on the first segment we assume the minimum chunk size >= GEAR_HASHLEN )
+		for (int warmup_iter = 0; warmup_iter < 8; warmup_iter++) {
+			__m512i cbytes = _mm512_i32gather_epi32(vindex, file_data + file_data_offset + (4 * warmup_iter), 1);
+			for (uint64_t j = 0; j < sizeof(int32_t); j++) {
+				doGearAvx512(hash, cbytes);
+			}
+		}
+		unsigned int gather_i = 8;
+		vindex = _mm512_add_epi32(vindex, _mm512_set1_epi32(32));
+		while (gather_i < gather_count) {
+			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
+				//printf("Processing data stream at [0X%x-0X%x-1]: 0x%x bytes/thread parallel\n", offset, offset+cur_segsize*LANE_COUNT, cur_segsize);
+				__m512i cbytes = _mm512_i32gather_epi32(vindex, file_data + file_data_offset + (4 * inner_gather_i), 1);
+
+				for (uint64_t j = 0; j < sizeof(int32_t); j++) {
+					doGearAvx512(hash, cbytes);
+
+					//__m512i cut_judgment_vmask = _mm512_and_epi32(hash, mm_break_mark);
+					//__mmask16 lane_cutpoint_mask = _mm512_cmpeq_epi32_mask(cut_judgment_vmask, zero_vec);
+					const __mmask16 lane_cutpoint_mask = _mm512_testn_epi32_mask(hash, mm_break_mark);
+					cutpoint_bitmap_vmask = _mm512_srli_epi32(cutpoint_bitmap_vmask, 1);
+					if (lane_cutpoint_mask > 0) {
+						const __m512i ret = _mm512_maskz_set1_epi32(lane_cutpoint_mask, static_cast<int32_t>(1u << 31));
+						cutpoint_bitmap_vmask = _mm512_or_epi32(cutpoint_bitmap_vmask, ret);
+					}
+				}
+			}
+
+			// Only scatter results if there is any result to scatter (avoid expensive scatter if unneeded).
+			// Also do masked scatter to prevent scattering on lanes without results.
+			const __mmask16 lanes_with_results_mask = _mm512_cmpneq_epi32_mask(cutpoint_bitmap_vmask, zero_vec);
+			if (lanes_with_results_mask != 0) {
+				const auto cutpoint_bitmap_vindex = _mm512_srli_epi32(vindex, 3);  // vindex / 8
+				const auto cutpoint_bitmap_offset = file_data_offset >> 3;  // idem
+				_mm512_mask_i32scatter_epi32(
+					cutpoint_bitmap + cutpoint_bitmap_offset,
+					lanes_with_results_mask,
+					cutpoint_bitmap_vindex,
+					cutpoint_bitmap_vmask,
+					1
+				);
+			}
+
+			cutpoint_bitmap_vmask = zero_vec;
+			vindex = _mm512_add_epi32(vindex, _mm512_set1_epi32(32));
+			gather_i += 8;
+		}
+
+		file_data_offset += window_bytes - GEAR_HASHLEN;
+		total_bytes_left -= window_bytes - GEAR_HASHLEN;
+	}
+
+	// Deal with any leftover data serially
+	file_data_offset = file_data_offset >= GEAR_HASHLEN ? file_data_offset - GEAR_HASHLEN : 0;
+	uint32_t pattern = 0;
+	// "Regenerate" the gear hash so we can continue with leftover data as if we didn't separate the processing
+	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
+		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		file_data_offset++;
+	}
+	// Finish the remaining data and add results to the cutpoint_bitmap
+	while (file_data_offset < file_size) {
+		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		if (!(pattern & mask)) {
+			const uint32_t byte_pos = file_data_offset / 8u;
+			const uint8_t bit_pos = file_data_offset % 8u;
+			cutpoint_bitmap[byte_pos] = cutpoint_bitmap[byte_pos] | static_cast<uint8_t>(1u << bit_pos);
+		}
+		file_data_offset++;
+	}
+}
+#undef doGearAvx512
+
+static inline void gather_gear_entries_avx512(
+		__m512i cbytes,
+		__m512i byte_mask,
+		__m512i& tentry0,
+		__m512i& tentry1,
+		__m512i& tentry2,
+		__m512i& tentry3) {
+	const __m512i idx0 = _mm512_and_epi32(cbytes, byte_mask);
+	const __m512i idx1 = _mm512_and_epi32(_mm512_srli_epi32(cbytes, 8), byte_mask);
+	const __m512i idx2 = _mm512_and_epi32(_mm512_srli_epi32(cbytes, 16), byte_mask);
+	const __m512i idx3 = _mm512_srli_epi32(cbytes, 24);
+
+	tentry0 = _mm512_i32gather_epi32(idx0, crct, 4);
+	tentry1 = _mm512_i32gather_epi32(idx1, crct, 4);
+	tentry2 = _mm512_i32gather_epi32(idx2, crct, 4);
+	tentry3 = _mm512_i32gather_epi32(idx3, crct, 4);
+}
+
+static inline void roll_gear_avx512(__m512i& hash, __m512i tentry) {
+	hash = _mm512_add_epi32(_mm512_slli_epi32(hash, 1), tentry);
+}
+
+static inline void record_cutpoints_avx512(
+		__m512i hash,
+		__m512i break_mark,
+		__m512i& cutpoint_bitmap_vmask) {
+	const __mmask16 lane_cutpoint_mask = _mm512_testn_epi32_mask(hash, break_mark);
+	cutpoint_bitmap_vmask = _mm512_srli_epi32(cutpoint_bitmap_vmask, 1);
+	if (lane_cutpoint_mask != 0) {
+		const __m512i ret = _mm512_maskz_set1_epi32(lane_cutpoint_mask, static_cast<int32_t>(1u << 31));
+		cutpoint_bitmap_vmask = _mm512_or_epi32(cutpoint_bitmap_vmask, ret);
+	}
+}
+
+// Code adapted from NetApp's SSCDC repo
+// Precondition: cutpoint_bitmap is allocated with at least (file_size / 8) (+1 if not divisible) bytes (ideally aligned to 64bytes=512bits)
+static void sscdc_chunking_phase_one_avx512_gear_with_gather_scheduling(uint32_t mask, uint64_t min_block_size, const unsigned char* RESTRICT file_data, uint64_t file_size, uint8_t* RESTRICT cutpoint_bitmap) {
+	static constexpr uint32_t LANE_COUNT = 16;
+	const __m512i mm_break_mark = _mm512_set1_epi32(mask);
+	const __m512i cmask = _mm512_set1_epi32(0xff);
+	uint64_t file_data_offset = 0;
+	uint64_t total_bytes_left = file_size;
+
+	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {  // if bytes left are too few just complete the remainder with serial version
+		// Ensure the window offsets don't overflow (2GB, max i32 value)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// SS-CDC would only need GEAR_HASHLEN - 1 of overlap between lane/thread segments, but we just use GEAR_HASHLEN as its easier.
+		// Also ensure each lane has a even number of GEAR_HASHLEN bytes sets of data to roll GEAR to.
+		// We do this so when we scatter the bitmap results we do it efficiently.
+		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
+		// Add GEAR_HASHLEN overlap and we still have an even number of GEAR_HASHLEN bytes=8 Gather instructions
+		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
+		// Readjust window_bytes as it might now be a few bytes smaller because of divisibility
+		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
+
+		__m512i vindex = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+		// bytes_per_lane_without_overlap used for each lane's start pos, lanes overlap at the end of their data into next lane's data.
+		// This applies even for the last lane, the next iteration will start at the start of the last lane's overlap data.
+		vindex = _mm512_mullo_epi32(vindex, _mm512_set1_epi32(bytes_per_lane_without_overlap));
+
+		const auto zero_vec = _mm512_set1_epi32(0);
+
+		__m512i hash = zero_vec;
+		__m512i cutpoint_bitmap_vmask = zero_vec;
+		// We know exactly how many Gathers we will need to process all data in the window as each Gather gets 32bits/4bytes of data
+		// per lane, and bytes_per_lane is divisible by GEAR_HASHLEN=8 Gather instructions.
+		const unsigned int gather_count = (bytes_per_lane / GEAR_HASHLEN) * 8;
+		// First do the "warmup" so each lane gets the valid GEAR hash pattern after the overlap with the previous lane's data
+		// ( for the first lane on the first segment we assume the minimum chunk size >= GEAR_HASHLEN )
+		for (int warmup_iter = 0; warmup_iter < 8; warmup_iter++) {
+			const __m512i cbytes = _mm512_i32gather_epi32(vindex, file_data + file_data_offset + (4 * warmup_iter), 1);
+			__m512i tentry0;
+			__m512i tentry1;
+			__m512i tentry2;
+			__m512i tentry3;
+			gather_gear_entries_avx512(cbytes, cmask, tentry0, tentry1, tentry2, tentry3);
+			roll_gear_avx512(hash, tentry0);
+			roll_gear_avx512(hash, tentry1);
+			roll_gear_avx512(hash, tentry2);
+			roll_gear_avx512(hash, tentry3);
+		}
+		unsigned int gather_i = 8;
+		vindex = _mm512_add_epi32(vindex, _mm512_set1_epi32(32));
+		__m512i cbytes_by_gather[8]{};
+		__m512i tentries_by_gather[8][4]{};
+		__m512i hashes_by_gather[8][4]{};
+		while (gather_i < gather_count) {
+			// We will execute batches of 8 x 4 bytes, but scheduling the Gathers for better performance
+			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
+				cbytes_by_gather[inner_gather_i] = _mm512_i32gather_epi32(vindex, file_data + file_data_offset + (4 * inner_gather_i), 1);
+			}
+
+			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
+				auto& tentry = tentries_by_gather[inner_gather_i];
+				gather_gear_entries_avx512(cbytes_by_gather[inner_gather_i], cmask, tentry[0], tentry[1], tentry[2], tentry[3]);
+			}
+
+			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
+				//printf("Processing data stream at [0X%x-0X%x-1]: 0x%x bytes/thread parallel\n", offset, offset+cur_segsize*LANE_COUNT, cur_segsize);
+				roll_gear_avx512(hash, tentries_by_gather[inner_gather_i][0]);
+				hashes_by_gather[inner_gather_i][0] = hash;
+				roll_gear_avx512(hash, tentries_by_gather[inner_gather_i][1]);
+				hashes_by_gather[inner_gather_i][1] = hash;
+				roll_gear_avx512(hash, tentries_by_gather[inner_gather_i][2]);
+				hashes_by_gather[inner_gather_i][2] = hash;
+				roll_gear_avx512(hash, tentries_by_gather[inner_gather_i][3]);
+				hashes_by_gather[inner_gather_i][3] = hash;
+			}
+
+			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
+				record_cutpoints_avx512(hashes_by_gather[inner_gather_i][0], mm_break_mark, cutpoint_bitmap_vmask);
+				record_cutpoints_avx512(hashes_by_gather[inner_gather_i][1], mm_break_mark, cutpoint_bitmap_vmask);
+				record_cutpoints_avx512(hashes_by_gather[inner_gather_i][2], mm_break_mark, cutpoint_bitmap_vmask);
+				record_cutpoints_avx512(hashes_by_gather[inner_gather_i][3], mm_break_mark, cutpoint_bitmap_vmask);
+			}
+
+			// Only scatter results if there is any result to scatter (avoid expensive scatter if unneeded).
+			// Also do masked scatter to prevent scattering on lanes without results.
+			const __mmask16 lanes_with_results_mask = _mm512_cmpneq_epi32_mask(cutpoint_bitmap_vmask, zero_vec);
+			if (lanes_with_results_mask != 0) {
+				const auto cutpoint_bitmap_vindex = _mm512_srli_epi32(vindex, 3);  // vindex / 8
+				const auto cutpoint_bitmap_offset = file_data_offset >> 3;  // idem
+				_mm512_mask_i32scatter_epi32(
+					cutpoint_bitmap + cutpoint_bitmap_offset,
+					lanes_with_results_mask,
+					cutpoint_bitmap_vindex,
+					cutpoint_bitmap_vmask,
+					1
+				);
+			}
+
+			cutpoint_bitmap_vmask = zero_vec;
+			vindex = _mm512_add_epi32(vindex, _mm512_set1_epi32(32));
+			gather_i += 8;
+		}
+
+		file_data_offset += window_bytes - GEAR_HASHLEN;
+		total_bytes_left -= window_bytes - GEAR_HASHLEN;
+	}
+
+	// Deal with any leftover data serially
+	file_data_offset = file_data_offset >= GEAR_HASHLEN ? file_data_offset - GEAR_HASHLEN : 0;
+	uint32_t pattern = 0;
+	// "Regenerate" the gear hash so we can continue with leftover data as if we didn't separate the processing
+	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
+		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		file_data_offset++;
+	}
+	// Finish the remaining data and add results to the cutpoint_bitmap
+	while (file_data_offset < file_size) {
+		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		if (!(pattern & mask)) {
+			const uint32_t byte_pos = file_data_offset / 8u;
+			const uint8_t bit_pos = file_data_offset % 8u;
+			cutpoint_bitmap[byte_pos] = cutpoint_bitmap[byte_pos] | static_cast<uint8_t>(1u << bit_pos);
+		}
+		file_data_offset++;
+	}
+}
+#endif
+
+#if defined(__AVX2__)
+#define doGearAvx2(hash, cbytes) {\
+					hash = _mm256_slli_epi32(hash, 1);\
+					__m256i idx = _mm256_and_si256(cbytes, cmask);\
+					cbytes = _mm256_srli_epi32(cbytes, 8);\
+					__m256i tentry = _mm256_i32gather_epi32(reinterpret_cast<const int*>(crct), idx, 4);\
+					hash = _mm256_add_epi32(hash, tentry);}
+
+// AVX2 version of SS-CDC phase one. AVX2 has no scatter instruction, so sparse lane results are stored individually.
+// Precondition: cutpoint_bitmap is allocated with at least (file_size / 8) (+1 if not divisible) bytes. (ideally aligned to 32bytes=256bits)
+static void sscdc_chunking_phase_one_avx2_gear(uint32_t mask, uint64_t min_block_size, const unsigned char* RESTRICT file_data, uint64_t file_size, uint8_t* RESTRICT cutpoint_bitmap) {
+	static constexpr uint32_t LANE_COUNT = 8;
+	const __m256i mm_break_mark = _mm256_set1_epi32(mask);
+	const __m256i cmask = _mm256_set1_epi32(0xff);
+	const __m256i zero_vec = _mm256_setzero_si256();
+	const __m256i high_bit_vec = _mm256_set1_epi32(static_cast<int32_t>(1u << 31));
+	uint64_t file_data_offset = 0;
+	uint64_t total_bytes_left = file_size;
+
+	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
+		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
+		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
+		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
+
+		__m256i vindex = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+		vindex = _mm256_mullo_epi32(vindex, _mm256_set1_epi32(bytes_per_lane_without_overlap));
+
+		__m256i hash = zero_vec;
+		__m256i cutpoint_bitmap_vmask = zero_vec;
+		const unsigned int gather_count = (bytes_per_lane / GEAR_HASHLEN) * 8;
+		for (int warmup_iter = 0; warmup_iter < 8; warmup_iter++) {
+			__m256i cbytes = _mm256_i32gather_epi32(
+				reinterpret_cast<const int*>(file_data + file_data_offset + (4 * warmup_iter)),
+				vindex,
+				1
+			);
+			for (uint64_t j = 0; j < sizeof(int32_t); j++) {
+				doGearAvx2(hash, cbytes);
+			}
+		}
+
+		unsigned int gather_i = 8;
+		vindex = _mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN));
+		while (gather_i < gather_count) {
+			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
+				__m256i cbytes = _mm256_i32gather_epi32(
+					reinterpret_cast<const int*>(file_data + file_data_offset + (4 * inner_gather_i)),
+					vindex,
+					1
+				);
+
+				for (uint64_t j = 0; j < sizeof(int32_t); j++) {
+					doGearAvx2(hash, cbytes);
+					const __m256i lane_cutpoint_mask = _mm256_cmpeq_epi32(
+						_mm256_and_si256(hash, mm_break_mark),
+						zero_vec
+					);
+					cutpoint_bitmap_vmask = _mm256_srli_epi32(cutpoint_bitmap_vmask, 1);
+					cutpoint_bitmap_vmask = _mm256_or_si256(
+						cutpoint_bitmap_vmask,
+						_mm256_and_si256(lane_cutpoint_mask, high_bit_vec)
+					);
+				}
+			}
+
+			if (!_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
+				alignas(32) uint32_t bitmap_words[LANE_COUNT];
+				_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
+				const uint64_t bitmap_batch_offset =
+					(file_data_offset + gather_i * sizeof(int32_t)) >> 3;
+				const uint64_t bitmap_bytes_per_lane = bytes_per_lane_without_overlap >> 3;
+				for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
+					const uint64_t bitmap_offset = bitmap_batch_offset + lane_i * bitmap_bytes_per_lane;
+					std::memcpy(cutpoint_bitmap + bitmap_offset, &bitmap_words[lane_i], sizeof(uint32_t));
+				}
+			}
+
+			cutpoint_bitmap_vmask = zero_vec;
+			vindex = _mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN));
+			gather_i += 8;
+		}
+
+		file_data_offset += window_bytes - GEAR_HASHLEN;
+		total_bytes_left -= window_bytes - GEAR_HASHLEN;
+	}
+
+	file_data_offset = file_data_offset >= GEAR_HASHLEN ? file_data_offset - GEAR_HASHLEN : 0;
+	uint32_t pattern = 0;
+	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
+		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		file_data_offset++;
+	}
+	while (file_data_offset < file_size) {
+		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		if (!(pattern & mask)) {
+			const uint32_t byte_pos = file_data_offset / 8u;
+			const uint8_t bit_pos = file_data_offset % 8u;
+			cutpoint_bitmap[byte_pos] = cutpoint_bitmap[byte_pos] | static_cast<uint8_t>(1u << bit_pos);
+		}
+		file_data_offset++;
+	}
+}
+#undef doGearAvx2
+#endif
+
+static inline bool is_breakpoint(const uint8_t* cutpoint_bitmap, uint64_t idx) {
+	uint8_t b = cutpoint_bitmap[idx / 8];
+	return ((b >> (idx % 8)) & 0x1) == 1;
+}
+
+#if defined(__AVX512F__)
+static void next_chunk_avx512_v1(uint64_t min_block_size, uint64_t max_block_size, uint64_t prev_cut_offset, uint64_t file_size, uint64_t& current_chunk_size, const uint8_t* cutpoint_bitmap) {
+	__m512i zero_v = _mm512_set1_epi64(0);
+	const uint64_t chunk_size_limit = file_size >= prev_cut_offset + max_block_size ? max_block_size : file_size - prev_cut_offset;
+	current_chunk_size = std::min(min_block_size, chunk_size_limit);
+	// First align ourselves so the current chunk offset is at the start of a byte on the bitmask
+	const uint8_t disaligned_bits = (prev_cut_offset + current_chunk_size) % 8;
+	const uint8_t bits_to_alignment = disaligned_bits == 0 ? 0 : 8 - disaligned_bits;
+	const uint64_t chunk_size_limit_realigned = std::min(current_chunk_size + bits_to_alignment, chunk_size_limit);
+	while (current_chunk_size < chunk_size_limit_realigned) {
+		if (is_breakpoint(cutpoint_bitmap, prev_cut_offset + current_chunk_size)) {
+			//printf("idx: %lu\n", prev_cut_offset + current_chunk_size);
+			break;
+		}
+		current_chunk_size++;
+	}
+
+	// Now that we are aligned on the bitmask we figure out how many 512bit vectors we can fit inside and use them to advance 512bits at a time,
+	// at least until an actual cutpoint is found
+	const uint64_t chunk_size_limit_multiple512 = current_chunk_size + (((chunk_size_limit - current_chunk_size) / 512u) * 512u);
+	while (current_chunk_size < chunk_size_limit_multiple512) {
+		__m512i bits = _mm512_loadu_si512(&cutpoint_bitmap[(prev_cut_offset + current_chunk_size) / 8]);
+		__mmask8 lane_has_result_bitmask = _mm512_cmpneq_epi64_mask(bits, zero_v);
+		if (lane_has_result_bitmask == 0) {
+			current_chunk_size += 512ull;
+			continue;
+		}
+		uint8_t lane_i = 0;
+		while (((lane_has_result_bitmask >> lane_i) & 0x1) == 0) {
+			lane_i++;
+		}
+		uint8_t bit = 0;
+		for (; bit < 64; bit++) {
+			if (is_breakpoint(cutpoint_bitmap, prev_cut_offset + current_chunk_size + lane_i * 64ull + bit)) {
+				//printf("idx: %lu\n", prev_cut_offset + current_chunk_size);
+				break;
+			}
+		}
+		current_chunk_size += lane_i * 64ull + bit;
+		break;
+	}
+
+	// If we still didn't find a cutpoint we attempt on any leftover bits that didn't fit into a 512bit vector.
+	// If we don't find a cutpoint here, we will end up cutting using the max_chunksize.
+	if (current_chunk_size == chunk_size_limit_multiple512) {
+		while (current_chunk_size < chunk_size_limit) {
+			if (is_breakpoint(cutpoint_bitmap, prev_cut_offset + current_chunk_size)) {
+				//printf("idx: %lu\n", prev_cut_offset + current_chunk_size);
+				break;
+			}
+			current_chunk_size++;
+		}
+	}
+}
+#endif
+
+#if defined(__AVX2__)
+static void next_chunk_avx256_v1(uint64_t min_block_size, uint64_t max_block_size, uint64_t prev_cut_offset, uint64_t file_size, uint64_t& current_chunk_size, const uint8_t* cutpoint_bitmap) {
+	const __m256i zero_v = _mm256_setzero_si256();
+	const uint64_t chunk_size_limit = file_size >= prev_cut_offset + max_block_size ? max_block_size : file_size - prev_cut_offset;
+	current_chunk_size = std::min(min_block_size, chunk_size_limit);
+	// First align ourselves so the current chunk offset is at the start of a byte on the bitmap.
+	const uint8_t disaligned_bits = (prev_cut_offset + current_chunk_size) % 8;
+	const uint8_t bits_to_alignment = disaligned_bits == 0 ? 0 : 8 - disaligned_bits;
+	const uint64_t chunk_size_limit_realigned = std::min(current_chunk_size + bits_to_alignment, chunk_size_limit);
+	while (current_chunk_size < chunk_size_limit_realigned) {
+		if (is_breakpoint(cutpoint_bitmap, prev_cut_offset + current_chunk_size)) {
+			break;
+		}
+		current_chunk_size++;
+	}
+
+	// Advance 256 source positions at a time until a vector containing a cutpoint is found.
+	const uint64_t chunk_size_limit_multiple256 = current_chunk_size + (((chunk_size_limit - current_chunk_size) / 256u) * 256u);
+	while (current_chunk_size < chunk_size_limit_multiple256) {
+		const __m256i bits = _mm256_loadu_si256(
+			reinterpret_cast<const __m256i*>(&cutpoint_bitmap[(prev_cut_offset + current_chunk_size) / 8])
+		);
+		if (_mm256_testz_si256(bits, bits)) {
+			current_chunk_size += 256ull;
+			continue;
+		}
+
+		const __m256i zero_lanes = _mm256_cmpeq_epi64(bits, zero_v);
+		const uint8_t lane_has_result_bitmask = static_cast<uint8_t>(
+			(~_mm256_movemask_pd(_mm256_castsi256_pd(zero_lanes))) & 0x0f
+		);
+		uint8_t lane_i = 0;
+		while (((lane_has_result_bitmask >> lane_i) & 0x1) == 0) {
+			lane_i++;
+		}
+		uint8_t bit = 0;
+		for (; bit < 64; bit++) {
+			if (is_breakpoint(cutpoint_bitmap, prev_cut_offset + current_chunk_size + lane_i * 64ull + bit)) {
+				break;
+			}
+		}
+		current_chunk_size += lane_i * 64ull + bit;
+		break;
+	}
+
+	// Scan any positions that did not fit into a complete 256-bit bitmap vector.
+	if (current_chunk_size == chunk_size_limit_multiple256) {
+		while (current_chunk_size < chunk_size_limit) {
+			if (is_breakpoint(cutpoint_bitmap, prev_cut_offset + current_chunk_size)) {
+				break;
+			}
+			current_chunk_size++;
+		}
+	}
+}
+#endif
+
+static void next_chunk_serial(uint64_t min_block_size, uint64_t max_block_size, uint64_t prev_cut_offset, uint64_t file_size, uint64_t& current_chunk_size, const uint8_t* cutpoint_bitmap) {
+	// You might argue this implementation is not truly serial as we essentially use 64bit unsigned ints as vectors.
+	// To that I say: I don't care. It still uses no SIMD instructions and is much faster, so I think a comparison to an
+	// artificially serialized algorithm that would never be used by anyone has no value, because an implementation like this
+	// is what would be used if SIMD is not available.
+
+	const uint64_t chunk_size_limit = file_size >= prev_cut_offset + max_block_size ? max_block_size : file_size - prev_cut_offset;
+	current_chunk_size = std::min(min_block_size, chunk_size_limit);
+	// First align ourselves so the current chunk offset is at the start of a byte on the bitmask
+	const uint8_t disaligned_bits = (prev_cut_offset + current_chunk_size) % 8;
+	const uint8_t bits_to_alignment = disaligned_bits == 0 ? 0 : 8 - disaligned_bits;
+	const uint64_t chunk_size_limit_realigned = std::min(current_chunk_size + bits_to_alignment, chunk_size_limit);
+	while (current_chunk_size < chunk_size_limit_realigned) {
+		if (is_breakpoint(cutpoint_bitmap, prev_cut_offset + current_chunk_size)) {
+			//printf("idx: %lu\n", prev_cut_offset + current_chunk_size);
+			break;
+		}
+		current_chunk_size++;
+	}
+
+	// Now that we are aligned on the bitmask we figure out how many 64bit "vectors" we can fit inside and use them to advance 64bits at a time,
+	// at least until an actual cutpoint is found
+	const uint64_t chunk_size_limit_multiple64 = current_chunk_size + (((chunk_size_limit - current_chunk_size) / 64u) * 64u);
+	while (current_chunk_size < chunk_size_limit_multiple64) {
+		uint64_t bits = *reinterpret_cast<const uint64_t*>(&cutpoint_bitmap[(prev_cut_offset + current_chunk_size) / 8]);
+		if (bits == 0) {
+			current_chunk_size += 64;
+			continue;
+		}
+		uint8_t bit = 0;
+		for (; bit < 64; bit++) {
+			if (is_breakpoint(cutpoint_bitmap, prev_cut_offset + current_chunk_size + bit)) {
+				//printf("idx: %lu\n", prev_cut_offset + current_chunk_size);
+				break;
+			}
+		}
+		current_chunk_size += bit;
+		break;
+	}
+
+	// If we still didn't find a cutpoint we attempt on any leftover bits that didn't fit into a 64bit vector.
+	// If we don't find a cutpoint here, we will end up cutting using the max_chunksize.
+	if (current_chunk_size == chunk_size_limit_multiple64) {
+		while (current_chunk_size < chunk_size_limit) {
+			if (is_breakpoint(cutpoint_bitmap, prev_cut_offset + current_chunk_size)) {
+				//printf("idx: %lu\n", prev_cut_offset + current_chunk_size);
+				break;
+			}
+			current_chunk_size++;
+		}
+	}
+}
+
+static bool next_chunk(uint64_t min_block_size, uint64_t max_block_size, uint64_t file_size, chunk_boundary& cb, SIMD_Mode simd_mode, const uint8_t* cutpoint_bitmap) {
+	uint64_t current_chunk_size = 0;
+	uint64_t prev_cut_offset = cb.right;
+
+	if (file_size <= prev_cut_offset)
+		return false;
+
+	switch (simd_mode) {
+		case SIMD_Mode::NONE:
+			next_chunk_serial(min_block_size, max_block_size, prev_cut_offset, file_size, current_chunk_size, cutpoint_bitmap);
+			break;
+		case SIMD_Mode::AVX256:
+		#if defined(__AVX2__)
+			next_chunk_avx256_v1(min_block_size, max_block_size, prev_cut_offset, file_size, current_chunk_size, cutpoint_bitmap);
+			break;
+		#else
+			std::cerr << "AVX256 chunk scanning requested, but AVX2 support is not compiled in" << std::endl;
+			exit(EXIT_FAILURE);
+		#endif
+		case SIMD_Mode::AVX512:
+		#if defined(__AVX512F__)
+			next_chunk_avx512_v1(min_block_size, max_block_size, prev_cut_offset, file_size, current_chunk_size, cutpoint_bitmap);
+			break;
+		#else
+			std::cerr << "AVX512 chunk scanning requested, but AVX-512 support is not compiled in" << std::endl;
+			exit(EXIT_FAILURE);
+		#endif
+		default:
+			std::cerr << "Unsupported SIMD mode requested for SS-CDC chunk scanning" << std::endl;
+			exit(EXIT_FAILURE);
+	}
+
+	cb.left = prev_cut_offset;
+	cb.right = prev_cut_offset + current_chunk_size;
+	return true;
+}
+
+std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
+	if (simd_mode == SIMD_Mode::NONE) {
+		return Chunking_Technique::chunk_file(file_path);
+	}
+
+	using phase_one_function = void (*)(uint32_t, uint64_t, const unsigned char*, uint64_t, uint8_t*);
+	phase_one_function phase_one = nullptr;
+	switch (simd_mode) {
+	#if defined(__AVX2__)
+		case SIMD_Mode::AVX256:
+			phase_one = sscdc_chunking_phase_one_avx2_gear;
+			break;
+	#endif
+	#if defined(__AVX512F__)
+		case SIMD_Mode::AVX512: {
+			switch (optimization_level) {
+				case 1:
+					phase_one = sscdc_chunking_phase_one_avx512_gear_with_gather_scheduling;
+					break;
+				default:
+					phase_one = sscdc_chunking_phase_one_avx512_gear;
+					break;
+			}
+			break;
+		}
+	#endif
+		default:
+			std::cout << "SIMD mode unsupported for chosen chunking technique" << std::endl;
+			exit(1);
+	}
+
+	std::ifstream file_ptr;
+	file_ptr.open(file_path, std::ios::in);
+
+	file_ptr.seekg(0, std::ios_base::end);
+	file_size = file_ptr.tellg();
+	file_ptr.seekg(0, std::ios_base::beg);
+
+	const auto bitmap_size = (file_size + 7) / 8 + HASHLEN / 8;
+	if (cutpoint_bitmap) {
+		portable_aligned_free(cutpoint_bitmap);
+	}
+	cutpoint_bitmap = static_cast<uint8_t*>(portable_aligned_alloc(64, bitmap_size));
+	if (!cutpoint_bitmap) {
+		printf("Error: allocate breakpoint bitmap failed, exit\n");
+		exit(2);
+	}
+	std::memset(cutpoint_bitmap, 0, bitmap_size);
+
+	std::vector<unsigned char> file_data{};
+	file_data.resize(file_size);
+	file_ptr.read(reinterpret_cast<char*>(file_data.data()), file_size);
+
+	auto begin_chunking = std::chrono::high_resolution_clock::now();
+	// mask was made for 64bits on the most significant bits, shift and cast to 32bit
+	uint32_t avg_mask = static_cast<uint32_t>(mask >> 32);
+	phase_one(avg_mask, min_block_size, file_data.data(), file_size, cutpoint_bitmap);
+	auto end_chunking = std::chrono::high_resolution_clock::now();
+	total_time_chunking += (end_chunking - begin_chunking);
+
+	std::memset(&cb, 0, sizeof(chunk_boundary));
+	std::vector<std::string> hashes{};
+	uint64_t prev_cut_offset = cb.right;
+	while (next_chunk(min_block_size, max_block_size, file_size, cb, SIMD_Mode::NONE, cutpoint_bitmap)) {
+#ifndef NDEBUG
+		// DEBUG: serially check next chunk size, crash if there is a mismatch
+		auto debug_curr_pos = prev_cut_offset;
+		uint32_t hash = 0;
+		for (; debug_curr_pos < file_size; debug_curr_pos++) {
+			hash = (hash << 1) + crct[file_data[debug_curr_pos]];
+			if (!(hash & avg_mask) && (debug_curr_pos - prev_cut_offset >= min_block_size)) {
+				break;
+			}
+			if ((debug_curr_pos - prev_cut_offset == max_block_size)) {
+				break;
+			}
+		}
+		uint64_t debug_chunk_size = debug_curr_pos - prev_cut_offset;
+#endif
+
+		uint64_t chunk_size = cb.right - prev_cut_offset;
+
+#ifndef NDEBUG
+		if (chunk_size != debug_chunk_size) {
+			fprintf(stderr, "FIXING BAD CHUNK WITH SERIAL VERSION!\n");
+			chunk_size = debug_chunk_size;
+			cb.right = debug_curr_pos;
+		}
+#endif
+
+		File_Chunk new_chunk{ chunk_size };
+		memcpy(new_chunk.get_data(), file_data.data() + prev_cut_offset, chunk_size);
+		if (!disable_hashing) {
+			auto begin_hashing = std::chrono::high_resolution_clock::now();
+			hash_method->hash_chunk(new_chunk);
+			auto end_hashing = std::chrono::high_resolution_clock::now();
+			total_time_hashing += (end_hashing - begin_hashing);
+		}
+		hashes.emplace_back(new_chunk.to_string());
+
+		prev_cut_offset = cb.right;
+	}
+	return hashes;
+}
+
+uint64_t Gear_Chunking::find_cutpoint(char* data, uint64_t size) {
+    if (simd_mode == SIMD_Mode::NONE)
+      return find_cutpoint_serial(data, size);
+	else if (simd_mode == SIMD_Mode::AVX256 || simd_mode == SIMD_Mode::AVX512) {
+		uint64_t prev_cut_offset = cb.right;
+		next_chunk(min_block_size, max_block_size, file_size, cb, simd_mode, cutpoint_bitmap);
+		return cb.right - prev_cut_offset;
+		//return find_cutpoint_avx512(data, size);
+	}
+    else {
+      std::cout << "SIMD mode unsupported for chosen chunking technique" << std::endl;
+      exit(1);
+    }
+}
+
+uint64_t Gear_Chunking::find_cutpoint_serial(char* data, uint64_t size) {
+  uint64_t hash = 0;
+  uint64_t idx = min_block_size;
+
+  // If given data is lower than the minimum chunk size, return data length.
+  if (size <= min_block_size) {
+    return size;
+  }
+
+  while (idx < size && idx < max_block_size) {
+    hash = ghash(hash, data[idx]);
+    if (!(hash & mask)) {
+      return idx;
+    }
+    idx += 1;
+  }
+
+  return idx;
+}
+
+uint64_t Gear_Chunking::find_cutpoint_avx512(char* data, uint64_t size) {
+  uint64_t hash = 0;
+  uint64_t idx = min_block_size;
+
+  // If given data is lower than the minimum chunk size, return data length.
+  if (size <= min_block_size) {
+    return size;
+  }
+
+  while (idx < size && idx < max_block_size) {
+    hash = ghash(hash, data[idx]);
+    if (!(hash & mask)) {
+      return idx;
+    }
+    idx += 1;
+  }
+
+  return idx;
+}
