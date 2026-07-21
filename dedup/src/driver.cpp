@@ -28,6 +28,7 @@
 #include "supercdc.hpp"
 #include "fixed_chunking.hpp"
 #include "gear_chunking.hpp"
+#include "cdcz_chunking.hpp"
 #include "rabins_chunking.hpp"
 #include "ram_chunking.hpp"
 #include "crc_chunking.hpp"
@@ -177,8 +178,11 @@ int main(int argc, char* argv[]) {
               chunk_method = std::make_unique<FastCDC>(config);
               break;
             case ChunkingTech::SUPERCDC:
-              chunk_method = std::make_unique<SuperCDC>(config);
-              break;
+                chunk_method = std::make_unique<SuperCDC>(config);
+                break;
+            case ChunkingTech::CDCZ:
+                chunk_method = std::make_unique<Cdcz_Chunking>(config);
+                break;
             case ChunkingTech::RAM:
                 chunk_method = std::make_unique<RAM_Chunking>(config);
                 break;

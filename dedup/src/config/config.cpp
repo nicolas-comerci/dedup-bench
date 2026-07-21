@@ -22,7 +22,9 @@ ChunkingTech Config::get_chunking_tech() const {
         } else if (value == "fastcdc") {
             return ChunkingTech::FASTCDC;
         } else if (value == "supercdc") {
-          return ChunkingTech::SUPERCDC;
+            return ChunkingTech::SUPERCDC;
+        } else if (value == "cdcz") {
+            return ChunkingTech::CDCZ;
         } else if (value == "ram") {
             return ChunkingTech::RAM;
         } else if(value == "maxp"){
