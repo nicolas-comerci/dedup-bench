@@ -63,6 +63,7 @@ enum class ChunkingTech {
     GEAR,
     FASTCDC,
     SUPERCDC,
+    CDCZ,
     MAXP,
     RAM,
     EXPERIMENT,
