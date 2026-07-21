@@ -171,8 +171,8 @@ static void sscdc_chunking_phase_one_avx512_gear(uint32_t mask, uint64_t min_blo
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {  // if bytes left are too few just complete the remainder with serial version
-		// Ensure the window offsets don't overflow (2GB, max i32 value)
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		// SS-CDC would only need GEAR_HASHLEN - 1 of overlap between lane/thread segments, but we just use GEAR_HASHLEN as its easier.
 		// Also ensure each lane has a even number of GEAR_HASHLEN bytes sets of data to roll GEAR to.
 		// We do this so when we scatter the bitmap results we do it efficiently.
@@ -312,8 +312,8 @@ static void sscdc_chunking_phase_one_avx512_gear_with_gather_scheduling(uint32_t
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {  // if bytes left are too few just complete the remainder with serial version
-		// Ensure the window offsets don't overflow (2GB, max i32 value)
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		// SS-CDC would only need GEAR_HASHLEN - 1 of overlap between lane/thread segments, but we just use GEAR_HASHLEN as its easier.
 		// Also ensure each lane has a even number of GEAR_HASHLEN bytes sets of data to roll GEAR to.
 		// We do this so when we scatter the bitmap results we do it efficiently.
@@ -527,7 +527,8 @@ static void sscdc_chunking_phase_one_avx2_gear(uint32_t mask, uint64_t min_block
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
@@ -624,7 +625,8 @@ static void sscdc_chunking_phase_one_avx2_gear_with_gather_scheduling(uint32_t m
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
@@ -739,7 +741,8 @@ static void sscdc_chunking_phase_one_avx2_gear_with_load_transpose(uint32_t mask
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
@@ -927,7 +930,8 @@ static void sscdc_chunking_phase_one_avx512_gear_with_load_transpose(uint32_t ma
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
