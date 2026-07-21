@@ -167,6 +167,26 @@ static void cdcz_chunking_phase_one_serial_gear(uint32_t mask, uint64_t min_bloc
 	}
 }
 
+static inline bool is_chunk_invariance_condition_satisfied(
+  bool is_prev_candidate_hard, uint64_t dist_with_prev, CutPointCandidateType new_candidate_type,
+  uint64_t min_size, uint64_t avg_size, uint64_t max_size
+) {
+	return is_prev_candidate_hard &&
+	  // Given that the previous candidate is of HARD type, either it will be used, or it will be discarded which can only happen
+	  // if a cut was used with at most min_size distance before the previous candidate. Knowing the previous cut to be used is
+	  // at most at distance_w_prev_cut_candidate + min_size distance we can ensure we don't violate max_size if we use the current candidate.
+	  (dist_with_prev + min_size <= max_size) &&
+	  (
+		// We also need to check that the current candidate is actually eligible, a HARD type cut needs to be at least min_size from the previous
+		// cut to be valid, whereas an EASY cut needs to be at least avg_size from it.
+		// Note that we check using distance_w_prev_cut_candidate, with the same logic as the check we did for the max_size, if it won't be used
+		// then the actual distance to the previous cut will be even larger so these conditions will also validate the eligibility of the current
+		// candidate in that case
+		(new_candidate_type == CutPointCandidateType::HARD_CUT_MASK && dist_with_prev >= min_size) ||
+		(new_candidate_type == CutPointCandidateType::EASY_CUT_MASK && dist_with_prev >= avg_size)
+	  );
+}
+
 #if defined(__AVX512F__)
 #define doGearAvx512(hash, cbytes) {\
 					hash = _mm512_slli_epi32(hash, 1);\
@@ -188,6 +208,10 @@ static void cdcz_chunking_phase_one_avx512_gear(
 ) {
 	static constexpr uint32_t LANE_COUNT = 16;
 	std::array<std::vector<CutPointCandidate>, LANE_COUNT> lane_results{};
+	std::array<bool, LANE_COUNT> lane_achieved_chunk_invariance{};
+	lane_achieved_chunk_invariance.fill(false);
+	lane_achieved_chunk_invariance[0] = true;
+
 	const __m512i mm_break_mark = _mm512_set1_epi32(mask);
 	const __m512i cmask = _mm512_set1_epi32(0xff);
 	uint64_t file_data_offset = 0;
@@ -216,8 +240,8 @@ static void cdcz_chunking_phase_one_avx512_gear(
 	};
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {  // if bytes left are too few just complete the remainder with serial version
-		// Ensure the window offsets don't overflow (2GB, max i32 value)
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		// SS-CDC would only need GEAR_HASHLEN - 1 of overlap between lane/thread segments, but we just use GEAR_HASHLEN as its easier.
 		// Also ensure each lane has a even number of GEAR_HASHLEN bytes sets of data to roll GEAR to.
 		// We do this so when we scatter the bitmap results we do it efficiently.
@@ -278,10 +302,43 @@ static void cdcz_chunking_phase_one_avx512_gear(
 					uint32_t bit = 0;
 					while (candidates_hard_bits != 0) {
 						if (candidates_hard_bits & 0b1) {
-							lane_results[lane_i].push_back({
-								CutPointCandidateType::HARD_CUT_MASK,
-								file_data_offset + static_cast<uint64_t>(lane_pos) + bit
-							});
+							const uint64_t candidate_pos = file_data_offset + static_cast<uint64_t>(lane_pos) + bit;
+							if (!lane_achieved_chunk_invariance[lane_i]) {
+								if (!lane_results[lane_i].empty()) {
+									const auto& prev_cut_candidate = lane_results[lane_i].back();
+									const uint64_t dist_with_prev = candidate_pos - prev_cut_candidate.offset;
+									const bool is_prev_candidate_hard = prev_cut_candidate.type == CutPointCandidateType::HARD_CUT_MASK;
+									const auto result_type = CutPointCandidateType::HARD_CUT_MASK;
+									// If this happens this lane is back in sync with non-segmented processing.
+									if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, dist_with_prev, result_type, min_block_size, 0/*avg_size*/, max_block_size)) {
+										lane_achieved_chunk_invariance[lane_i] = true;
+									}
+								}
+								// The first candidate cannot establish chunk invariability, but must be retained
+								// so the next candidate has a valid predecessor to compare against.
+								lane_results[lane_i].push_back({
+									CutPointCandidateType::HARD_CUT_MASK,
+									candidate_pos
+								});
+							}
+							else {
+								// Only the first lane could have empty lane_results, and we know the prev_cut_offset for it
+								uint64_t prev_cut_pos = lane_results[lane_i].empty() ? prev_cut_offset : lane_results[lane_i].back().offset;
+								uint64_t dist_with_prev = candidate_pos - prev_cut_pos;
+
+								while (dist_with_prev >= max_block_size) {
+									prev_cut_pos = candidate_pos - dist_with_prev + max_block_size;
+									lane_results[lane_i].push_back({CutPointCandidateType::MAX_SIZE, prev_cut_pos});
+									dist_with_prev = candidate_pos - prev_cut_pos;
+								}
+
+								if (dist_with_prev >= min_block_size) {
+									lane_results[lane_i].push_back({
+										CutPointCandidateType::HARD_CUT_MASK,
+										candidate_pos
+									});
+								}
+							}
 						}
 						candidates_hard_bits >>= 1;
 						bit++;
@@ -295,6 +352,8 @@ static void cdcz_chunking_phase_one_avx512_gear(
 		}
 
 		consume_lane_results();
+		lane_achieved_chunk_invariance.fill(false);
+		lane_achieved_chunk_invariance[0] = true;
 
 		file_data_offset += window_bytes - GEAR_HASHLEN;
 		total_bytes_left -= window_bytes - GEAR_HASHLEN;
@@ -319,10 +378,12 @@ static void cdcz_chunking_phase_one_avx512_gear(
 
 	consume_lane_results();
 
+	// Add as many max size chunks as needed after the last detected cutpoint
 	while (file_size - prev_cut_offset > max_block_size) {
 		prev_cut_offset += max_block_size;
 		cutpoints.emplace_back(prev_cut_offset);
 	}
+	// Add a final cut for the end of the file
 	if (prev_cut_offset < file_size) {
 		cutpoints.emplace_back(file_size);
 	}
@@ -381,8 +442,8 @@ static void cdcz_chunking_phase_one_avx512_gear_with_gather_scheduling(
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {  // if bytes left are too few just complete the remainder with serial version
-		// Ensure the window offsets don't overflow (2GB, max i32 value)
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		// SS-CDC would only need GEAR_HASHLEN - 1 of overlap between lane/thread segments, but we just use GEAR_HASHLEN as its easier.
 		// Also ensure each lane has a even number of GEAR_HASHLEN bytes sets of data to roll GEAR to.
 		// We do this so when we scatter the bitmap results we do it efficiently.
@@ -604,7 +665,8 @@ static void cdcz_chunking_phase_one_avx2_gear(
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
@@ -709,7 +771,8 @@ static void cdcz_chunking_phase_one_avx2_gear_with_gather_scheduling(
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
@@ -832,7 +895,8 @@ static void cdcz_chunking_phase_one_avx2_gear_with_load_transpose(
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
@@ -1028,7 +1092,8 @@ static void cdcz_chunking_phase_one_avx512_gear_with_load_transpose(
 	uint64_t total_bytes_left = file_size;
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		uint64_t window_bytes = std::min<uint64_t>(1 << 24, total_bytes_left);
+		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
 		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
