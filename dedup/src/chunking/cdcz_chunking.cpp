@@ -670,7 +670,10 @@ static void cdcz_chunking_phase_one_avx2_gear(
 	lane_achieved_chunk_invariance.fill(false);
 	lane_achieved_chunk_invariance[0] = true;
 
-	const __m256i mm_break_mark = _mm256_set1_epi32(mask);
+	const uint32_t hard_mask = mask | (mask >> 1);
+	const uint32_t easy_mask = mask << 1;
+	const __m256i mm_break_mark_hard = _mm256_set1_epi32(hard_mask);
+	const __m256i mm_break_mark_easy = _mm256_set1_epi32(easy_mask);
 	const __m256i cmask = _mm256_set1_epi32(0xff);
 	const __m256i zero_vec = _mm256_setzero_si256();
 	const __m256i high_bit_vec = _mm256_set1_epi32(static_cast<int32_t>(1u << 31));
@@ -690,7 +693,13 @@ static void cdcz_chunking_phase_one_avx2_gear(
 					cutpoints.emplace_back(prev_cut_offset);
 				}
 
-				if (candidate.offset - prev_cut_offset >= min_block_size) {
+				const uint64_t dist_with_prev = candidate.offset - prev_cut_offset;
+				const bool candidate_is_eligible =
+					(candidate.type == CutPointCandidateType::HARD_CUT_MASK && dist_with_prev >= min_block_size) ||
+					(candidate.type == CutPointCandidateType::EASY_CUT_MASK && dist_with_prev >= avg_block_size) ||
+					candidate.type == CutPointCandidateType::MAX_SIZE ||
+					candidate.type == CutPointCandidateType::EOF_CUT;
+				if (candidate_is_eligible) {
 					prev_cut_offset = candidate.offset;
 					cutpoints.emplace_back(prev_cut_offset);
 				}
@@ -724,7 +733,8 @@ static void cdcz_chunking_phase_one_avx2_gear(
 		std::array<uint64_t, LANE_COUNT> lane_candidate_floor{};
 
 		__m256i hash = zero_vec;
-		__m256i cutpoint_bitmap_vmask = zero_vec;
+		__m256i candidates_hard_vmask = zero_vec;
+		__m256i candidates_easy_vmask = zero_vec;
 		for (int warmup_iter = 0; warmup_iter < 8; warmup_iter++) {
 			__m256i cbytes = _mm256_i32gather_epi32(
 				reinterpret_cast<const int*>(file_data + file_data_offset + (4 * warmup_iter)),
@@ -740,6 +750,7 @@ static void cdcz_chunking_phase_one_avx2_gear(
 		__m256i lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
 		while (_mm256_movemask_epi8(lanes_at_end) != -1) {
 			const __m256i active_lanes_mask = _mm256_xor_si256(lanes_at_end, all_lanes_mask);
+			const __m256i candidate_high_bit_vec = _mm256_andnot_si256(lanes_at_end, high_bit_vec);
 			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
 				__m256i cbytes = _mm256_mask_i32gather_epi32(
 					zero_vec,
@@ -751,23 +762,33 @@ static void cdcz_chunking_phase_one_avx2_gear(
 
 				for (uint64_t j = 0; j < sizeof(int32_t); j++) {
 					doGearAvx2(hash, cbytes);
-					const __m256i lane_cutpoint_mask = _mm256_and_si256(
-						_mm256_cmpeq_epi32(
-							_mm256_and_si256(hash, mm_break_mark),
-							zero_vec
-						),
-						active_lanes_mask
+					const __m256i lane_easy_mask = _mm256_cmpeq_epi32(
+						_mm256_and_si256(hash, mm_break_mark_easy),
+						zero_vec
 					);
-					cutpoint_bitmap_vmask = _mm256_srli_epi32(cutpoint_bitmap_vmask, 1);
-					cutpoint_bitmap_vmask = _mm256_or_si256(
-						cutpoint_bitmap_vmask,
-						_mm256_and_si256(lane_cutpoint_mask, high_bit_vec)
+					candidates_easy_vmask = _mm256_srli_epi32(candidates_easy_vmask, 1);
+					candidates_hard_vmask = _mm256_srli_epi32(candidates_hard_vmask, 1);
+					if (_mm256_testz_si256(lane_easy_mask, lane_easy_mask)) {
+						continue;
+					}
+					candidates_easy_vmask = _mm256_or_si256(
+						candidates_easy_vmask,
+						_mm256_and_si256(lane_easy_mask, candidate_high_bit_vec)
+					);
+					const __m256i lane_hard_mask = _mm256_cmpeq_epi32(
+						_mm256_and_si256(hash, mm_break_mark_hard),
+						zero_vec
+					);
+					candidates_hard_vmask = _mm256_or_si256(
+						candidates_hard_vmask,
+						_mm256_and_si256(lane_hard_mask, candidate_high_bit_vec)
 					);
 				}
 			}
 
-			if (_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
-				cutpoint_bitmap_vmask = zero_vec;
+			if (_mm256_testz_si256(candidates_easy_vmask, candidates_easy_vmask)) {
+				candidates_easy_vmask = zero_vec;
+				candidates_hard_vmask = zero_vec;
 				vindex = _mm256_min_epi32(
 					_mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN)),
 					vindex_end
@@ -776,8 +797,10 @@ static void cdcz_chunking_phase_one_avx2_gear(
 				continue;
 			}
 
-			alignas(32) uint32_t bitmap_words[LANE_COUNT];
-			_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
+			alignas(32) uint32_t hard_bitmap_words[LANE_COUNT];
+			alignas(32) uint32_t easy_bitmap_words[LANE_COUNT];
+			_mm256_store_si256(reinterpret_cast<__m256i*>(hard_bitmap_words), candidates_hard_vmask);
+			_mm256_store_si256(reinterpret_cast<__m256i*>(easy_bitmap_words), candidates_easy_vmask);
 
 			alignas(32) uint32_t current_lane_positions[LANE_COUNT];
 			alignas(32) uint32_t next_lane_positions[LANE_COUNT];
@@ -803,10 +826,10 @@ static void cdcz_chunking_phase_one_avx2_gear(
 				bool lane_accepted_candidate = false;
 
 				{
-					uint32_t candidates_hard_bits = bitmap_words[lane_i];
-					while (candidates_hard_bits != 0) {
-						const uint32_t bit = _tzcnt_u32(candidates_hard_bits);
-						candidates_hard_bits &= candidates_hard_bits - 1;
+					uint32_t candidates_easy_bits = easy_bitmap_words[lane_i];
+					while (candidates_easy_bits != 0) {
+						const uint32_t bit = _tzcnt_u32(candidates_easy_bits);
+						candidates_easy_bits &= candidates_easy_bits - 1;
 						const uint64_t candidate_relative_pos =
 							static_cast<uint64_t>(current_lane_positions[lane_i]) + bit;
 						if (candidate_relative_pos < lane_candidate_floor[lane_i]) {
@@ -814,18 +837,20 @@ static void cdcz_chunking_phase_one_avx2_gear(
 						}
 
 						const uint64_t candidate_pos = file_data_offset + candidate_relative_pos;
+					const auto result_type = ((hard_bitmap_words[lane_i] >> bit) & 1u) != 0
+							? CutPointCandidateType::HARD_CUT_MASK
+							: CutPointCandidateType::EASY_CUT_MASK;
 						if (!lane_achieved_chunk_invariance[lane_i]) {
 							if (!lane_results[lane_i].empty()) {
 								const auto& prev_cut_candidate = lane_results[lane_i].back();
 								const uint64_t dist_with_prev = candidate_pos - prev_cut_candidate.offset;
 								const bool is_prev_candidate_hard = prev_cut_candidate.type == CutPointCandidateType::HARD_CUT_MASK;
-								const auto result_type = CutPointCandidateType::HARD_CUT_MASK;
-								if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, dist_with_prev, result_type, min_block_size, 0/*avg_size*/, max_block_size)) {
+										if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, dist_with_prev, result_type, min_block_size, avg_block_size, max_block_size)) {
 									lane_achieved_chunk_invariance[lane_i] = true;
 								}
 							}
 							lane_results[lane_i].push_back({
-								CutPointCandidateType::HARD_CUT_MASK,
+								result_type,
 								candidate_pos
 							});
 						}
@@ -839,9 +864,10 @@ static void cdcz_chunking_phase_one_avx2_gear(
 								dist_with_prev = candidate_pos - prev_cut_pos;
 							}
 
-							if (dist_with_prev >= min_block_size) {
+							if ((result_type == CutPointCandidateType::HARD_CUT_MASK && dist_with_prev >= min_block_size) ||
+							(result_type == CutPointCandidateType::EASY_CUT_MASK && dist_with_prev >= avg_block_size)) {
 								lane_results[lane_i].push_back({
-									CutPointCandidateType::HARD_CUT_MASK,
+									result_type,
 									candidate_pos
 								});
 								lane_candidate_floor[lane_i] = candidate_relative_pos + min_block_size;
@@ -871,7 +897,8 @@ static void cdcz_chunking_phase_one_avx2_gear(
 
 			vindex = _mm256_load_si256(reinterpret_cast<const __m256i*>(next_lane_positions));
 
-			cutpoint_bitmap_vmask = zero_vec;
+			candidates_easy_vmask = zero_vec;
+			candidates_hard_vmask = zero_vec;
 			lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
 		}
 
@@ -891,8 +918,11 @@ static void cdcz_chunking_phase_one_avx2_gear(
 	}
 	while (file_data_offset < file_size) {
 		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
-		if (!(pattern & mask)) {
-			lane_results[LANE_COUNT - 1].push_back({CutPointCandidateType::HARD_CUT_MASK, file_data_offset});
+		if (!(pattern & easy_mask)) {
+			const auto result_type = !(pattern & hard_mask)
+				? CutPointCandidateType::HARD_CUT_MASK
+				: CutPointCandidateType::EASY_CUT_MASK;
+			lane_results[LANE_COUNT - 1].push_back({result_type, file_data_offset});
 		}
 		file_data_offset++;
 	}
@@ -931,7 +961,10 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 	lane_achieved_chunk_invariance.fill(false);
 	lane_achieved_chunk_invariance[0] = true;
 
-	const __m256i mm_break_mark = _mm256_set1_epi32(mask);
+	const uint32_t hard_mask = mask | (mask >> 1);
+	const uint32_t easy_mask = mask << 1;
+	const __m256i mm_break_mark_hard = _mm256_set1_epi32(hard_mask);
+	const __m256i mm_break_mark_easy = _mm256_set1_epi32(easy_mask);
 	const __m256i cmask = _mm256_set1_epi32(0xff);
 	const __m256i zero_vec = _mm256_setzero_si256();
 	const __m256i high_bit_vec = _mm256_set1_epi32(static_cast<int32_t>(1u << 31));
@@ -951,7 +984,13 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 					cutpoints.emplace_back(prev_cut_offset);
 				}
 
-				if (candidate.offset - prev_cut_offset >= min_block_size) {
+				const uint64_t dist_with_prev = candidate.offset - prev_cut_offset;
+				const bool candidate_is_eligible =
+					(candidate.type == CutPointCandidateType::HARD_CUT_MASK && dist_with_prev >= min_block_size) ||
+					(candidate.type == CutPointCandidateType::EASY_CUT_MASK && dist_with_prev >= avg_block_size) ||
+					candidate.type == CutPointCandidateType::MAX_SIZE ||
+					candidate.type == CutPointCandidateType::EOF_CUT;
+				if (candidate_is_eligible) {
 					prev_cut_offset = candidate.offset;
 					cutpoints.emplace_back(prev_cut_offset);
 				}
@@ -985,7 +1024,8 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 		std::array<uint64_t, LANE_COUNT> lane_candidate_floor{};
 
 		__m256i hash = zero_vec;
-		__m256i cutpoint_bitmap_vmask = zero_vec;
+		__m256i candidates_hard_vmask = zero_vec;
+		__m256i candidates_easy_vmask = zero_vec;
 		__m256i warmup_cbytes[8]{};
 		if constexpr (USE_LOAD_TRANSPOSE) {
 			alignas(32) uint32_t lane_positions[LANE_COUNT];
@@ -1022,7 +1062,7 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 		__m256i hashes_by_gather[8][4]{};
 		__m256i lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
 		while (_mm256_movemask_epi8(lanes_at_end) != -1) {
-			const __m256i active_lanes_mask = _mm256_xor_si256(lanes_at_end, all_lanes_mask);
+			const __m256i candidate_high_bit_vec = _mm256_andnot_si256(lanes_at_end, high_bit_vec);
 			if constexpr (USE_LOAD_TRANSPOSE) {
 				alignas(32) uint32_t lane_positions[LANE_COUNT];
 				_mm256_store_si256(reinterpret_cast<__m256i*>(lane_positions), vindex);
@@ -1034,6 +1074,7 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 				);
 			}
 			else {
+				const __m256i active_lanes_mask = _mm256_xor_si256(lanes_at_end, all_lanes_mask);
 				for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
 					cbytes_by_gather[inner_gather_i] = _mm256_mask_i32gather_epi32(
 						zero_vec,
@@ -1063,23 +1104,33 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 
 			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
 				for (uint32_t j = 0; j < 4; j++) {
-					const __m256i lane_cutpoint_mask = _mm256_and_si256(
-						_mm256_cmpeq_epi32(
-							_mm256_and_si256(hashes_by_gather[inner_gather_i][j], mm_break_mark),
-							zero_vec
-						),
-						active_lanes_mask
+					const __m256i lane_easy_mask = _mm256_cmpeq_epi32(
+						_mm256_and_si256(hashes_by_gather[inner_gather_i][j], mm_break_mark_easy),
+						zero_vec
 					);
-					cutpoint_bitmap_vmask = _mm256_srli_epi32(cutpoint_bitmap_vmask, 1);
-					cutpoint_bitmap_vmask = _mm256_or_si256(
-						cutpoint_bitmap_vmask,
-						_mm256_and_si256(lane_cutpoint_mask, high_bit_vec)
+					candidates_easy_vmask = _mm256_srli_epi32(candidates_easy_vmask, 1);
+					candidates_hard_vmask = _mm256_srli_epi32(candidates_hard_vmask, 1);
+					if (_mm256_testz_si256(lane_easy_mask, lane_easy_mask)) {
+						continue;
+					}
+					candidates_easy_vmask = _mm256_or_si256(
+						candidates_easy_vmask,
+						_mm256_and_si256(lane_easy_mask, candidate_high_bit_vec)
+					);
+					const __m256i lane_hard_mask = _mm256_cmpeq_epi32(
+						_mm256_and_si256(hashes_by_gather[inner_gather_i][j], mm_break_mark_hard),
+						zero_vec
+					);
+					candidates_hard_vmask = _mm256_or_si256(
+						candidates_hard_vmask,
+						_mm256_and_si256(lane_hard_mask, candidate_high_bit_vec)
 					);
 				}
 			}
 
-			if (_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
-				cutpoint_bitmap_vmask = zero_vec;
+			if (_mm256_testz_si256(candidates_easy_vmask, candidates_easy_vmask)) {
+				candidates_easy_vmask = zero_vec;
+				candidates_hard_vmask = zero_vec;
 				vindex = _mm256_min_epi32(
 					_mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN)),
 					vindex_end
@@ -1088,8 +1139,10 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 				continue;
 			}
 
-			alignas(32) uint32_t bitmap_words[LANE_COUNT];
-			_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
+			alignas(32) uint32_t hard_bitmap_words[LANE_COUNT];
+			alignas(32) uint32_t easy_bitmap_words[LANE_COUNT];
+			_mm256_store_si256(reinterpret_cast<__m256i*>(hard_bitmap_words), candidates_hard_vmask);
+			_mm256_store_si256(reinterpret_cast<__m256i*>(easy_bitmap_words), candidates_easy_vmask);
 
 			alignas(32) uint32_t current_lane_positions[LANE_COUNT];
 			alignas(32) uint32_t next_lane_positions[LANE_COUNT];
@@ -1114,10 +1167,10 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 				uint64_t desired_next_pos = normal_next_pos;
 				bool lane_accepted_candidate = false;
 
-				uint32_t candidates_hard_bits = bitmap_words[lane_i];
-				while (candidates_hard_bits != 0) {
-					const uint32_t bit = _tzcnt_u32(candidates_hard_bits);
-					candidates_hard_bits &= candidates_hard_bits - 1;
+				uint32_t candidates_easy_bits = easy_bitmap_words[lane_i];
+				while (candidates_easy_bits != 0) {
+					const uint32_t bit = _tzcnt_u32(candidates_easy_bits);
+					candidates_easy_bits &= candidates_easy_bits - 1;
 					const uint64_t candidate_relative_pos =
 						static_cast<uint64_t>(current_lane_positions[lane_i]) + bit;
 					if (candidate_relative_pos < lane_candidate_floor[lane_i]) {
@@ -1125,17 +1178,19 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 					}
 
 					const uint64_t candidate_pos = file_data_offset + candidate_relative_pos;
+					const auto result_type = ((hard_bitmap_words[lane_i] >> bit) & 1u) != 0
+							? CutPointCandidateType::HARD_CUT_MASK
+							: CutPointCandidateType::EASY_CUT_MASK;
 					if (!lane_achieved_chunk_invariance[lane_i]) {
 						if (!lane_results[lane_i].empty()) {
 							const auto& prev_cut_candidate = lane_results[lane_i].back();
 							const uint64_t dist_with_prev = candidate_pos - prev_cut_candidate.offset;
 							const bool is_prev_candidate_hard = prev_cut_candidate.type == CutPointCandidateType::HARD_CUT_MASK;
-							const auto result_type = CutPointCandidateType::HARD_CUT_MASK;
-							if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, dist_with_prev, result_type, min_block_size, 0, max_block_size)) {
+								if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, dist_with_prev, result_type, min_block_size, avg_block_size, max_block_size)) {
 								lane_achieved_chunk_invariance[lane_i] = true;
 							}
 						}
-						lane_results[lane_i].push_back({CutPointCandidateType::HARD_CUT_MASK, candidate_pos});
+						lane_results[lane_i].push_back({result_type, candidate_pos});
 					}
 					else {
 						uint64_t prev_cut_pos = lane_results[lane_i].empty() ? prev_cut_offset : lane_results[lane_i].back().offset;
@@ -1147,8 +1202,9 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 							dist_with_prev = candidate_pos - prev_cut_pos;
 						}
 
-						if (dist_with_prev >= min_block_size) {
-							lane_results[lane_i].push_back({CutPointCandidateType::HARD_CUT_MASK, candidate_pos});
+						if ((result_type == CutPointCandidateType::HARD_CUT_MASK && dist_with_prev >= min_block_size) ||
+							(result_type == CutPointCandidateType::EASY_CUT_MASK && dist_with_prev >= avg_block_size)) {
+							lane_results[lane_i].push_back({result_type, candidate_pos});
 							lane_candidate_floor[lane_i] = candidate_relative_pos + min_block_size;
 							uint64_t washout_start =
 								lane_candidate_floor[lane_i] >= GEAR_HASHLEN
@@ -1170,7 +1226,8 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 			}
 
 			vindex = _mm256_load_si256(reinterpret_cast<const __m256i*>(next_lane_positions));
-			cutpoint_bitmap_vmask = zero_vec;
+			candidates_easy_vmask = zero_vec;
+			candidates_hard_vmask = zero_vec;
 			lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
 		}
 
@@ -1190,8 +1247,11 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 	}
 	while (file_data_offset < file_size) {
 		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
-		if (!(pattern & mask)) {
-			lane_results[LANE_COUNT - 1].push_back({CutPointCandidateType::HARD_CUT_MASK, file_data_offset});
+		if (!(pattern & easy_mask)) {
+			const auto result_type = !(pattern & hard_mask)
+				? CutPointCandidateType::HARD_CUT_MASK
+				: CutPointCandidateType::EASY_CUT_MASK;
+			lane_results[LANE_COUNT - 1].push_back({result_type, file_data_offset});
 		}
 		file_data_offset++;
 	}
@@ -1751,7 +1811,11 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 
 	auto begin_chunking = std::chrono::high_resolution_clock::now();
 	// mask was made for 64bits on the most significant bits, shift and cast to 32bit
-	uint32_t avg_mask = static_cast<uint32_t>(mask >> 32);
+	const uint32_t avg_mask = static_cast<uint32_t>(mask >> 32);
+#ifndef NDEBUG
+	const uint32_t hard_mask = avg_mask | (avg_mask >> 1);
+	const uint32_t easy_mask = avg_mask << 1;
+#endif
 	phase_one(avg_mask, avg_block_size, min_block_size, max_block_size, file_data, file_size, cutpoint_bitmap, cutpoints);
 	auto end_chunking = std::chrono::high_resolution_clock::now();
 	total_time_chunking += (end_chunking - begin_chunking);
@@ -1768,7 +1832,13 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 		uint32_t hash = 0;
 		for (; debug_curr_pos < file_size; debug_curr_pos++) {
 			hash = (hash << 1) + crct[file_data[debug_curr_pos]];
-			if (!(hash & avg_mask) && (debug_curr_pos - prev_cut_offset >= min_block_size)) {
+			const uint64_t debug_chunk_size = debug_curr_pos - prev_cut_offset;
+			const bool normalized_match =
+				(debug_chunk_size >= min_block_size && debug_chunk_size < avg_block_size && !(hash & hard_mask)) ||
+				(debug_chunk_size >= avg_block_size && !(hash & easy_mask));
+			const bool average_mask_match = debug_chunk_size >= min_block_size && !(hash & avg_mask);
+			if ((simd_mode == SIMD_Mode::AVX256 && normalized_match) ||
+				(simd_mode != SIMD_Mode::AVX256 && average_mask_match)) {
 				break;
 			}
 			if ((debug_curr_pos - prev_cut_offset == max_block_size)) {
