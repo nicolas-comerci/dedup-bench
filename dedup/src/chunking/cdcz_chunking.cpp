@@ -199,6 +199,7 @@ static inline bool is_chunk_invariance_condition_satisfied(
 // Precondition: cutpoint_bitmap is allocated with at least (file_size / 8) (+1 if not divisible) bytes (ideally aligned to 64bytes=512bits)
 static void cdcz_chunking_phase_one_avx512_gear(
 	uint32_t mask,
+	uint64_t,
 	uint64_t min_block_size,
 	uint64_t max_block_size,
 	const unsigned char* RESTRICT file_data,
@@ -428,6 +429,7 @@ static inline void record_cutpoints_avx512(
 // Precondition: cutpoint_bitmap is allocated with at least (file_size / 8) (+1 if not divisible) bytes (ideally aligned to 64bytes=512bits)
 static void cdcz_chunking_phase_one_avx512_gear_with_gather_scheduling(
 	uint32_t mask,
+	uint64_t,
 	uint64_t min_block_size,
 	uint64_t max_block_size,
 	const unsigned char* RESTRICT file_data,
@@ -608,13 +610,17 @@ static inline void record_cutpoints_avx2(
 
 static inline void load_and_transpose_8x8_epi32_avx2(
 		const unsigned char* RESTRICT file_data,
-		uint64_t bytes_per_lane,
+		const uint32_t (&lane_positions)[8],
+		const uint32_t (&lane_end_positions)[8],
 		__m256i (&columns)[8]) {
-	assert((reinterpret_cast<std::uintptr_t>(file_data) % 32) == 0);
-	assert((bytes_per_lane % 32) == 0);
+	assert((reinterpret_cast<std::uintptr_t>(file_data) % GEAR_HASHLEN) == 0);
 	__m256i rows[8];
 	for (uint32_t lane_i = 0; lane_i < 8; lane_i++) {
-		rows[lane_i] = _mm256_load_si256(reinterpret_cast<const __m256i*>(file_data + lane_i * bytes_per_lane));
+		assert((lane_positions[lane_i] % GEAR_HASHLEN) == 0);
+		assert((lane_end_positions[lane_i] % GEAR_HASHLEN) == 0);
+		rows[lane_i] = lane_positions[lane_i] == lane_end_positions[lane_i]
+			? _mm256_setzero_si256()
+			: _mm256_load_si256(reinterpret_cast<const __m256i*>(file_data + lane_positions[lane_i]));
 	}
 
 	const __m256i unpacked32_0 = _mm256_unpacklo_epi32(rows[0], rows[1]);
@@ -649,6 +655,7 @@ static inline void load_and_transpose_8x8_epi32_avx2(
 // Precondition: cutpoint_bitmap is allocated with at least (file_size / 8) (+1 if not divisible) bytes. (ideally aligned to 32bytes=256bits)
 static void cdcz_chunking_phase_one_avx2_gear(
 	uint32_t mask,
+	uint64_t avg_block_size,
 	uint64_t min_block_size,
 	uint64_t max_block_size,
 	const unsigned char* RESTRICT file_data,
@@ -657,12 +664,40 @@ static void cdcz_chunking_phase_one_avx2_gear(
 	std::vector<uint64_t>& cutpoints
 ) {
 	static constexpr uint32_t LANE_COUNT = 8;
+	(void)cutpoint_bitmap;
+	std::array<std::vector<CutPointCandidate>, LANE_COUNT> lane_results{};
+	std::array<bool, LANE_COUNT> lane_achieved_chunk_invariance{};
+	lane_achieved_chunk_invariance.fill(false);
+	lane_achieved_chunk_invariance[0] = true;
+
 	const __m256i mm_break_mark = _mm256_set1_epi32(mask);
 	const __m256i cmask = _mm256_set1_epi32(0xff);
 	const __m256i zero_vec = _mm256_setzero_si256();
 	const __m256i high_bit_vec = _mm256_set1_epi32(static_cast<int32_t>(1u << 31));
 	uint64_t file_data_offset = 0;
 	uint64_t total_bytes_left = file_size;
+	uint64_t prev_cut_offset = 0;
+
+	const auto consume_lane_results = [&]() {
+		for (auto& lane_result : lane_results) {
+			for (const auto& candidate : lane_result) {
+				if (candidate.offset <= prev_cut_offset) {
+					continue;
+				}
+
+				while (candidate.offset - prev_cut_offset > max_block_size) {
+					prev_cut_offset += max_block_size;
+					cutpoints.emplace_back(prev_cut_offset);
+				}
+
+				if (candidate.offset - prev_cut_offset >= min_block_size) {
+					prev_cut_offset = candidate.offset;
+					cutpoints.emplace_back(prev_cut_offset);
+				}
+			}
+			lane_result.clear();
+		}
+	};
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
 		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
@@ -671,12 +706,25 @@ static void cdcz_chunking_phase_one_avx2_gear(
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
 
+		const uint64_t expected_candidates_per_lane =
+			((bytes_per_lane + avg_block_size - 1) / avg_block_size) + 2;
+		for (auto& lane_result : lane_results) {
+			lane_result.reserve(expected_candidates_per_lane);
+		}
+
 		__m256i vindex = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
 		vindex = _mm256_mullo_epi32(vindex, _mm256_set1_epi32(bytes_per_lane_without_overlap));
+		const __m256i vindex_end = _mm256_add_epi32(
+			vindex,
+			_mm256_set1_epi32(static_cast<int32_t>(bytes_per_lane))
+		);
+		alignas(32) uint32_t lane_end_positions[LANE_COUNT];
+		_mm256_store_si256(reinterpret_cast<__m256i*>(lane_end_positions), vindex_end);
+		const __m256i all_lanes_mask = _mm256_set1_epi32(-1);
+		std::array<uint64_t, LANE_COUNT> lane_candidate_floor{};
 
 		__m256i hash = zero_vec;
 		__m256i cutpoint_bitmap_vmask = zero_vec;
-		const unsigned int gather_count = (bytes_per_lane / GEAR_HASHLEN) * 8;
 		for (int warmup_iter = 0; warmup_iter < 8; warmup_iter++) {
 			__m256i cbytes = _mm256_i32gather_epi32(
 				reinterpret_cast<const int*>(file_data + file_data_offset + (4 * warmup_iter)),
@@ -688,21 +736,27 @@ static void cdcz_chunking_phase_one_avx2_gear(
 			}
 		}
 
-		unsigned int gather_i = 8;
 		vindex = _mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN));
-		while (gather_i < gather_count) {
+		__m256i lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
+		while (_mm256_movemask_epi8(lanes_at_end) != -1) {
+			const __m256i active_lanes_mask = _mm256_xor_si256(lanes_at_end, all_lanes_mask);
 			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
-				__m256i cbytes = _mm256_i32gather_epi32(
+				__m256i cbytes = _mm256_mask_i32gather_epi32(
+					zero_vec,
 					reinterpret_cast<const int*>(file_data + file_data_offset + (4 * inner_gather_i)),
 					vindex,
+					active_lanes_mask,
 					1
 				);
 
 				for (uint64_t j = 0; j < sizeof(int32_t); j++) {
 					doGearAvx2(hash, cbytes);
-					const __m256i lane_cutpoint_mask = _mm256_cmpeq_epi32(
-						_mm256_and_si256(hash, mm_break_mark),
-						zero_vec
+					const __m256i lane_cutpoint_mask = _mm256_and_si256(
+						_mm256_cmpeq_epi32(
+							_mm256_and_si256(hash, mm_break_mark),
+							zero_vec
+						),
+						active_lanes_mask
 					);
 					cutpoint_bitmap_vmask = _mm256_srli_epi32(cutpoint_bitmap_vmask, 1);
 					cutpoint_bitmap_vmask = _mm256_or_si256(
@@ -712,22 +766,118 @@ static void cdcz_chunking_phase_one_avx2_gear(
 				}
 			}
 
-			if (!_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
-				alignas(32) uint32_t bitmap_words[LANE_COUNT];
-				_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
-				const uint64_t bitmap_batch_offset =
-					(file_data_offset + gather_i * sizeof(int32_t)) >> 3;
-				const uint64_t bitmap_bytes_per_lane = bytes_per_lane_without_overlap >> 3;
-				for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
-					const uint64_t bitmap_offset = bitmap_batch_offset + lane_i * bitmap_bytes_per_lane;
-					std::memcpy(cutpoint_bitmap + bitmap_offset, &bitmap_words[lane_i], sizeof(uint32_t));
-				}
+			if (_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
+				cutpoint_bitmap_vmask = zero_vec;
+				vindex = _mm256_min_epi32(
+					_mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN)),
+					vindex_end
+				);
+				lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
+				continue;
 			}
 
+			alignas(32) uint32_t bitmap_words[LANE_COUNT];
+			_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
+
+			alignas(32) uint32_t current_lane_positions[LANE_COUNT];
+			alignas(32) uint32_t next_lane_positions[LANE_COUNT];
+			_mm256_store_si256(reinterpret_cast<__m256i*>(current_lane_positions), vindex);
+			std::copy(
+				std::begin(current_lane_positions),
+				std::end(current_lane_positions),
+				std::begin(next_lane_positions)
+			);
+
+			for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
+				if (current_lane_positions[lane_i] == lane_end_positions[lane_i]) {
+					continue;
+				}
+
+				const uint64_t current_batch_end =
+					static_cast<uint64_t>(current_lane_positions[lane_i]) + GEAR_HASHLEN;
+				const uint64_t normal_next_pos = std::min<uint64_t>(
+					current_batch_end,
+					lane_end_positions[lane_i]
+				);
+				uint64_t desired_next_pos = normal_next_pos;
+				bool lane_accepted_candidate = false;
+
+				{
+					uint32_t candidates_hard_bits = bitmap_words[lane_i];
+					while (candidates_hard_bits != 0) {
+						const uint32_t bit = _tzcnt_u32(candidates_hard_bits);
+						candidates_hard_bits &= candidates_hard_bits - 1;
+						const uint64_t candidate_relative_pos =
+							static_cast<uint64_t>(current_lane_positions[lane_i]) + bit;
+						if (candidate_relative_pos < lane_candidate_floor[lane_i]) {
+							continue;
+						}
+
+						const uint64_t candidate_pos = file_data_offset + candidate_relative_pos;
+						if (!lane_achieved_chunk_invariance[lane_i]) {
+							if (!lane_results[lane_i].empty()) {
+								const auto& prev_cut_candidate = lane_results[lane_i].back();
+								const uint64_t dist_with_prev = candidate_pos - prev_cut_candidate.offset;
+								const bool is_prev_candidate_hard = prev_cut_candidate.type == CutPointCandidateType::HARD_CUT_MASK;
+								const auto result_type = CutPointCandidateType::HARD_CUT_MASK;
+								if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, dist_with_prev, result_type, min_block_size, 0/*avg_size*/, max_block_size)) {
+									lane_achieved_chunk_invariance[lane_i] = true;
+								}
+							}
+							lane_results[lane_i].push_back({
+								CutPointCandidateType::HARD_CUT_MASK,
+								candidate_pos
+							});
+						}
+						else {
+							uint64_t prev_cut_pos = lane_results[lane_i].empty() ? prev_cut_offset : lane_results[lane_i].back().offset;
+							uint64_t dist_with_prev = candidate_pos - prev_cut_pos;
+
+							while (dist_with_prev >= max_block_size) {
+								prev_cut_pos = candidate_pos - dist_with_prev + max_block_size;
+								lane_results[lane_i].push_back({CutPointCandidateType::MAX_SIZE, prev_cut_pos});
+								dist_with_prev = candidate_pos - prev_cut_pos;
+							}
+
+							if (dist_with_prev >= min_block_size) {
+								lane_results[lane_i].push_back({
+									CutPointCandidateType::HARD_CUT_MASK,
+									candidate_pos
+								});
+								lane_candidate_floor[lane_i] = candidate_relative_pos + min_block_size;
+								uint64_t washout_start =
+									lane_candidate_floor[lane_i] >= GEAR_HASHLEN
+										? lane_candidate_floor[lane_i] - GEAR_HASHLEN
+										: 0;
+								// Jump to the previous aligned position for better CPU load performance.
+								washout_start &= ~(static_cast<uint64_t>(GEAR_HASHLEN) - 1);
+								desired_next_pos = std::max<uint64_t>(
+									normal_next_pos,
+									washout_start
+								);
+								lane_accepted_candidate = true;
+							}
+						}
+					}
+				}
+
+				uint64_t next_lane_pos = normal_next_pos;
+				if (lane_accepted_candidate) {
+					next_lane_pos = std::min<uint64_t>(desired_next_pos, lane_end_positions[lane_i]);
+				}
+
+				next_lane_positions[lane_i] = static_cast<uint32_t>(next_lane_pos);
+			}
+
+			vindex = _mm256_load_si256(reinterpret_cast<const __m256i*>(next_lane_positions));
+
 			cutpoint_bitmap_vmask = zero_vec;
-			vindex = _mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN));
-			gather_i += 8;
+			lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
 		}
+
+		consume_lane_results();
+		lane_achieved_chunk_invariance.fill(false);
+		lane_achieved_chunk_invariance[0] = true;
 
 		file_data_offset += window_bytes - GEAR_HASHLEN;
 		total_bytes_left -= window_bytes - GEAR_HASHLEN;
@@ -742,19 +892,31 @@ static void cdcz_chunking_phase_one_avx2_gear(
 	while (file_data_offset < file_size) {
 		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
 		if (!(pattern & mask)) {
-			const uint32_t byte_pos = file_data_offset / 8u;
-			const uint8_t bit_pos = file_data_offset % 8u;
-			cutpoint_bitmap[byte_pos] = cutpoint_bitmap[byte_pos] | static_cast<uint8_t>(1u << bit_pos);
+			lane_results[LANE_COUNT - 1].push_back({CutPointCandidateType::HARD_CUT_MASK, file_data_offset});
 		}
 		file_data_offset++;
 	}
+
+	consume_lane_results();
+
+	// Add as many max size chunks as needed after the last detected cutpoint
+	while (file_size - prev_cut_offset > max_block_size) {
+		prev_cut_offset += max_block_size;
+		cutpoints.emplace_back(prev_cut_offset);
+	}
+	// Add a final cut for the end of the file
+	if (prev_cut_offset < file_size) {
+		cutpoints.emplace_back(file_size);
+	}
 }
 
-// AVX2 version of SS-CDC phase one with gathers scheduled in batches to expose more instruction-level parallelism.
+// Shared AVX2 CDCZ phase one for scheduled gathers and contiguous lane loads with transpose.
 // AVX2 has no scatter instruction, so sparse lane results are stored individually.
 // Precondition: cutpoint_bitmap is allocated with at least (file_size / 8) (+1 if not divisible) bytes. (ideally aligned to 32bytes=256bits)
-static void cdcz_chunking_phase_one_avx2_gear_with_gather_scheduling(
+template<bool USE_LOAD_TRANSPOSE>
+static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 	uint32_t mask,
+	uint64_t avg_block_size,
 	uint64_t min_block_size,
 	uint64_t max_block_size,
 	const unsigned char* RESTRICT file_data,
@@ -763,12 +925,40 @@ static void cdcz_chunking_phase_one_avx2_gear_with_gather_scheduling(
 	std::vector<uint64_t>& cutpoints
 ) {
 	static constexpr uint32_t LANE_COUNT = 8;
+	(void)cutpoint_bitmap;
+	std::array<std::vector<CutPointCandidate>, LANE_COUNT> lane_results{};
+	std::array<bool, LANE_COUNT> lane_achieved_chunk_invariance{};
+	lane_achieved_chunk_invariance.fill(false);
+	lane_achieved_chunk_invariance[0] = true;
+
 	const __m256i mm_break_mark = _mm256_set1_epi32(mask);
 	const __m256i cmask = _mm256_set1_epi32(0xff);
 	const __m256i zero_vec = _mm256_setzero_si256();
 	const __m256i high_bit_vec = _mm256_set1_epi32(static_cast<int32_t>(1u << 31));
 	uint64_t file_data_offset = 0;
 	uint64_t total_bytes_left = file_size;
+	uint64_t prev_cut_offset = 0;
+
+	const auto consume_lane_results = [&]() {
+		for (auto& lane_result : lane_results) {
+			for (const auto& candidate : lane_result) {
+				if (candidate.offset <= prev_cut_offset) {
+					continue;
+				}
+
+				while (candidate.offset - prev_cut_offset > max_block_size) {
+					prev_cut_offset += max_block_size;
+					cutpoints.emplace_back(prev_cut_offset);
+				}
+
+				if (candidate.offset - prev_cut_offset >= min_block_size) {
+					prev_cut_offset = candidate.offset;
+					cutpoints.emplace_back(prev_cut_offset);
+				}
+			}
+			lane_result.clear();
+		}
+	};
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
 		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
@@ -777,18 +967,44 @@ static void cdcz_chunking_phase_one_avx2_gear_with_gather_scheduling(
 		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
 		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
 
+		const uint64_t expected_candidates_per_lane =
+			((bytes_per_lane + avg_block_size - 1) / avg_block_size) + 2;
+		for (auto& lane_result : lane_results) {
+			lane_result.reserve(expected_candidates_per_lane);
+		}
+
 		__m256i vindex = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
 		vindex = _mm256_mullo_epi32(vindex, _mm256_set1_epi32(bytes_per_lane_without_overlap));
+		const __m256i vindex_end = _mm256_add_epi32(
+			vindex,
+			_mm256_set1_epi32(static_cast<int32_t>(bytes_per_lane))
+		);
+		alignas(32) uint32_t lane_end_positions[LANE_COUNT];
+		_mm256_store_si256(reinterpret_cast<__m256i*>(lane_end_positions), vindex_end);
+		const __m256i all_lanes_mask = _mm256_set1_epi32(-1);
+		std::array<uint64_t, LANE_COUNT> lane_candidate_floor{};
 
 		__m256i hash = zero_vec;
 		__m256i cutpoint_bitmap_vmask = zero_vec;
-		const unsigned int gather_count = (bytes_per_lane / GEAR_HASHLEN) * 8;
-		for (int warmup_iter = 0; warmup_iter < 8; warmup_iter++) {
-			const __m256i cbytes = _mm256_i32gather_epi32(
-				reinterpret_cast<const int*>(file_data + file_data_offset + (4 * warmup_iter)),
-				vindex,
-				1
+		__m256i warmup_cbytes[8]{};
+		if constexpr (USE_LOAD_TRANSPOSE) {
+			alignas(32) uint32_t lane_positions[LANE_COUNT];
+			_mm256_store_si256(reinterpret_cast<__m256i*>(lane_positions), vindex);
+			load_and_transpose_8x8_epi32_avx2(
+				file_data + file_data_offset,
+				lane_positions,
+				lane_end_positions,
+				warmup_cbytes
 			);
+		}
+		for (int warmup_iter = 0; warmup_iter < 8; warmup_iter++) {
+			const __m256i cbytes = USE_LOAD_TRANSPOSE
+				? warmup_cbytes[warmup_iter]
+				: _mm256_i32gather_epi32(
+					reinterpret_cast<const int*>(file_data + file_data_offset + (4 * warmup_iter)),
+					vindex,
+					1
+				);
 			__m256i tentry0;
 			__m256i tentry1;
 			__m256i tentry2;
@@ -800,18 +1016,33 @@ static void cdcz_chunking_phase_one_avx2_gear_with_gather_scheduling(
 			roll_gear_avx2(hash, tentry3);
 		}
 
-		unsigned int gather_i = 8;
 		vindex = _mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN));
 		__m256i cbytes_by_gather[8]{};
 		__m256i tentries_by_gather[8][4]{};
 		__m256i hashes_by_gather[8][4]{};
-		while (gather_i < gather_count) {
-			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
-				cbytes_by_gather[inner_gather_i] = _mm256_i32gather_epi32(
-					reinterpret_cast<const int*>(file_data + file_data_offset + (4 * inner_gather_i)),
-					vindex,
-					1
+		__m256i lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
+		while (_mm256_movemask_epi8(lanes_at_end) != -1) {
+			const __m256i active_lanes_mask = _mm256_xor_si256(lanes_at_end, all_lanes_mask);
+			if constexpr (USE_LOAD_TRANSPOSE) {
+				alignas(32) uint32_t lane_positions[LANE_COUNT];
+				_mm256_store_si256(reinterpret_cast<__m256i*>(lane_positions), vindex);
+				load_and_transpose_8x8_epi32_avx2(
+					file_data + file_data_offset,
+					lane_positions,
+					lane_end_positions,
+					cbytes_by_gather
 				);
+			}
+			else {
+				for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
+					cbytes_by_gather[inner_gather_i] = _mm256_mask_i32gather_epi32(
+						zero_vec,
+						reinterpret_cast<const int*>(file_data + file_data_offset + (4 * inner_gather_i)),
+						vindex,
+						active_lanes_mask,
+						1
+					);
+				}
 			}
 
 			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
@@ -831,28 +1062,121 @@ static void cdcz_chunking_phase_one_avx2_gear_with_gather_scheduling(
 			}
 
 			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
-				record_cutpoints_avx2(hashes_by_gather[inner_gather_i][0], mm_break_mark, zero_vec, high_bit_vec, cutpoint_bitmap_vmask);
-				record_cutpoints_avx2(hashes_by_gather[inner_gather_i][1], mm_break_mark, zero_vec, high_bit_vec, cutpoint_bitmap_vmask);
-				record_cutpoints_avx2(hashes_by_gather[inner_gather_i][2], mm_break_mark, zero_vec, high_bit_vec, cutpoint_bitmap_vmask);
-				record_cutpoints_avx2(hashes_by_gather[inner_gather_i][3], mm_break_mark, zero_vec, high_bit_vec, cutpoint_bitmap_vmask);
-			}
-
-			if (!_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
-				alignas(32) uint32_t bitmap_words[LANE_COUNT];
-				_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
-				const uint64_t bitmap_batch_offset =
-					(file_data_offset + gather_i * sizeof(int32_t)) >> 3;
-				const uint64_t bitmap_bytes_per_lane = bytes_per_lane_without_overlap >> 3;
-				for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
-					const uint64_t bitmap_offset = bitmap_batch_offset + lane_i * bitmap_bytes_per_lane;
-					std::memcpy(cutpoint_bitmap + bitmap_offset, &bitmap_words[lane_i], sizeof(uint32_t));
+				for (uint32_t j = 0; j < 4; j++) {
+					const __m256i lane_cutpoint_mask = _mm256_and_si256(
+						_mm256_cmpeq_epi32(
+							_mm256_and_si256(hashes_by_gather[inner_gather_i][j], mm_break_mark),
+							zero_vec
+						),
+						active_lanes_mask
+					);
+					cutpoint_bitmap_vmask = _mm256_srli_epi32(cutpoint_bitmap_vmask, 1);
+					cutpoint_bitmap_vmask = _mm256_or_si256(
+						cutpoint_bitmap_vmask,
+						_mm256_and_si256(lane_cutpoint_mask, high_bit_vec)
+					);
 				}
 			}
 
+			if (_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
+				cutpoint_bitmap_vmask = zero_vec;
+				vindex = _mm256_min_epi32(
+					_mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN)),
+					vindex_end
+				);
+				lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
+				continue;
+			}
+
+			alignas(32) uint32_t bitmap_words[LANE_COUNT];
+			_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
+
+			alignas(32) uint32_t current_lane_positions[LANE_COUNT];
+			alignas(32) uint32_t next_lane_positions[LANE_COUNT];
+			_mm256_store_si256(reinterpret_cast<__m256i*>(current_lane_positions), vindex);
+			std::copy(
+				std::begin(current_lane_positions),
+				std::end(current_lane_positions),
+				std::begin(next_lane_positions)
+			);
+
+			for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
+				if (current_lane_positions[lane_i] == lane_end_positions[lane_i]) {
+					continue;
+				}
+
+				const uint64_t current_batch_end =
+					static_cast<uint64_t>(current_lane_positions[lane_i]) + GEAR_HASHLEN;
+				const uint64_t normal_next_pos = std::min<uint64_t>(
+					current_batch_end,
+					lane_end_positions[lane_i]
+				);
+				uint64_t desired_next_pos = normal_next_pos;
+				bool lane_accepted_candidate = false;
+
+				uint32_t candidates_hard_bits = bitmap_words[lane_i];
+				while (candidates_hard_bits != 0) {
+					const uint32_t bit = _tzcnt_u32(candidates_hard_bits);
+					candidates_hard_bits &= candidates_hard_bits - 1;
+					const uint64_t candidate_relative_pos =
+						static_cast<uint64_t>(current_lane_positions[lane_i]) + bit;
+					if (candidate_relative_pos < lane_candidate_floor[lane_i]) {
+						continue;
+					}
+
+					const uint64_t candidate_pos = file_data_offset + candidate_relative_pos;
+					if (!lane_achieved_chunk_invariance[lane_i]) {
+						if (!lane_results[lane_i].empty()) {
+							const auto& prev_cut_candidate = lane_results[lane_i].back();
+							const uint64_t dist_with_prev = candidate_pos - prev_cut_candidate.offset;
+							const bool is_prev_candidate_hard = prev_cut_candidate.type == CutPointCandidateType::HARD_CUT_MASK;
+							const auto result_type = CutPointCandidateType::HARD_CUT_MASK;
+							if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, dist_with_prev, result_type, min_block_size, 0, max_block_size)) {
+								lane_achieved_chunk_invariance[lane_i] = true;
+							}
+						}
+						lane_results[lane_i].push_back({CutPointCandidateType::HARD_CUT_MASK, candidate_pos});
+					}
+					else {
+						uint64_t prev_cut_pos = lane_results[lane_i].empty() ? prev_cut_offset : lane_results[lane_i].back().offset;
+						uint64_t dist_with_prev = candidate_pos - prev_cut_pos;
+
+						while (dist_with_prev >= max_block_size) {
+							prev_cut_pos = candidate_pos - dist_with_prev + max_block_size;
+							lane_results[lane_i].push_back({CutPointCandidateType::MAX_SIZE, prev_cut_pos});
+							dist_with_prev = candidate_pos - prev_cut_pos;
+						}
+
+						if (dist_with_prev >= min_block_size) {
+							lane_results[lane_i].push_back({CutPointCandidateType::HARD_CUT_MASK, candidate_pos});
+							lane_candidate_floor[lane_i] = candidate_relative_pos + min_block_size;
+							uint64_t washout_start =
+								lane_candidate_floor[lane_i] >= GEAR_HASHLEN
+									? lane_candidate_floor[lane_i] - GEAR_HASHLEN
+									: 0;
+							// Jump to the previous aligned position for better CPU load performance.
+							washout_start &= ~(static_cast<uint64_t>(GEAR_HASHLEN) - 1);
+							desired_next_pos = std::max<uint64_t>(normal_next_pos, washout_start);
+							lane_accepted_candidate = true;
+						}
+					}
+				}
+
+				uint64_t next_lane_pos = normal_next_pos;
+				if (lane_accepted_candidate) {
+					next_lane_pos = std::min<uint64_t>(desired_next_pos, lane_end_positions[lane_i]);
+				}
+				next_lane_positions[lane_i] = static_cast<uint32_t>(next_lane_pos);
+			}
+
+			vindex = _mm256_load_si256(reinterpret_cast<const __m256i*>(next_lane_positions));
 			cutpoint_bitmap_vmask = zero_vec;
-			vindex = _mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN));
-			gather_i += 8;
+			lanes_at_end = _mm256_cmpeq_epi32(vindex, vindex_end);
 		}
+
+		consume_lane_results();
+		lane_achieved_chunk_invariance.fill(false);
+		lane_achieved_chunk_invariance[0] = true;
 
 		file_data_offset += window_bytes - GEAR_HASHLEN;
 		total_bytes_left -= window_bytes - GEAR_HASHLEN;
@@ -867,18 +1191,25 @@ static void cdcz_chunking_phase_one_avx2_gear_with_gather_scheduling(
 	while (file_data_offset < file_size) {
 		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
 		if (!(pattern & mask)) {
-			const uint32_t byte_pos = file_data_offset / 8u;
-			const uint8_t bit_pos = file_data_offset % 8u;
-			cutpoint_bitmap[byte_pos] = cutpoint_bitmap[byte_pos] | static_cast<uint8_t>(1u << bit_pos);
+			lane_results[LANE_COUNT - 1].push_back({CutPointCandidateType::HARD_CUT_MASK, file_data_offset});
 		}
 		file_data_offset++;
 	}
+
+	consume_lane_results();
+
+	while (file_size - prev_cut_offset > max_block_size) {
+		prev_cut_offset += max_block_size;
+		cutpoints.emplace_back(prev_cut_offset);
+	}
+	if (prev_cut_offset < file_size) {
+		cutpoints.emplace_back(file_size);
+	}
 }
 
-// AVX2 version of SS-CDC phase one that replaces input gathers with contiguous lane loads and an 8x8 dword transpose.
-// Gear-table lookups retain the gather scheduling used by the optimization-level-one implementation.
-static void cdcz_chunking_phase_one_avx2_gear_with_load_transpose(
+static void cdcz_chunking_phase_one_avx2_gear_with_gather_scheduling(
 	uint32_t mask,
+	uint64_t avg_block_size,
 	uint64_t min_block_size,
 	uint64_t max_block_size,
 	const unsigned char* RESTRICT file_data,
@@ -886,110 +1217,28 @@ static void cdcz_chunking_phase_one_avx2_gear_with_load_transpose(
 	uint8_t* RESTRICT cutpoint_bitmap,
 	std::vector<uint64_t>& cutpoints
 ) {
-	static constexpr uint32_t LANE_COUNT = 8;
-	const __m256i mm_break_mark = _mm256_set1_epi32(mask);
-	const __m256i cmask = _mm256_set1_epi32(0xff);
-	const __m256i zero_vec = _mm256_setzero_si256();
-	const __m256i high_bit_vec = _mm256_set1_epi32(static_cast<int32_t>(1u << 31));
-	uint64_t file_data_offset = 0;
-	uint64_t total_bytes_left = file_size;
+	cdcz_chunking_phase_one_avx2_gear_scheduled_impl<false>(
+		mask, avg_block_size, min_block_size, max_block_size,
+		file_data, file_size, cutpoint_bitmap, cutpoints
+	);
+}
 
-	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
-		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
-		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
-		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
-		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
-
-		__m256i hash = zero_vec;
-		__m256i cutpoint_bitmap_vmask = zero_vec;
-		const unsigned int gather_count = (bytes_per_lane / GEAR_HASHLEN) * 8;
-		__m256i cbytes_by_gather[8]{};
-		load_and_transpose_8x8_epi32_avx2(
-			file_data + file_data_offset,
-			bytes_per_lane_without_overlap,
-			cbytes_by_gather
-		);
-		for (int warmup_iter = 0; warmup_iter < 8; warmup_iter++) {
-			__m256i tentry0;
-			__m256i tentry1;
-			__m256i tentry2;
-			__m256i tentry3;
-			gather_gear_entries_avx2(cbytes_by_gather[warmup_iter], cmask, tentry0, tentry1, tentry2, tentry3);
-			roll_gear_avx2(hash, tentry0);
-			roll_gear_avx2(hash, tentry1);
-			roll_gear_avx2(hash, tentry2);
-			roll_gear_avx2(hash, tentry3);
-		}
-
-		unsigned int gather_i = 8;
-		__m256i tentries_by_gather[8][4]{};
-		__m256i hashes_by_gather[8][4]{};
-		while (gather_i < gather_count) {
-			load_and_transpose_8x8_epi32_avx2(
-				file_data + file_data_offset + gather_i * sizeof(int32_t),
-				bytes_per_lane_without_overlap,
-				cbytes_by_gather
-			);
-
-			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
-				auto& tentry = tentries_by_gather[inner_gather_i];
-				gather_gear_entries_avx2(cbytes_by_gather[inner_gather_i], cmask, tentry[0], tentry[1], tentry[2], tentry[3]);
-			}
-
-			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
-				roll_gear_avx2(hash, tentries_by_gather[inner_gather_i][0]);
-				hashes_by_gather[inner_gather_i][0] = hash;
-				roll_gear_avx2(hash, tentries_by_gather[inner_gather_i][1]);
-				hashes_by_gather[inner_gather_i][1] = hash;
-				roll_gear_avx2(hash, tentries_by_gather[inner_gather_i][2]);
-				hashes_by_gather[inner_gather_i][2] = hash;
-				roll_gear_avx2(hash, tentries_by_gather[inner_gather_i][3]);
-				hashes_by_gather[inner_gather_i][3] = hash;
-			}
-
-			for (int inner_gather_i = 0; inner_gather_i < 8; inner_gather_i++) {
-				record_cutpoints_avx2(hashes_by_gather[inner_gather_i][0], mm_break_mark, zero_vec, high_bit_vec, cutpoint_bitmap_vmask);
-				record_cutpoints_avx2(hashes_by_gather[inner_gather_i][1], mm_break_mark, zero_vec, high_bit_vec, cutpoint_bitmap_vmask);
-				record_cutpoints_avx2(hashes_by_gather[inner_gather_i][2], mm_break_mark, zero_vec, high_bit_vec, cutpoint_bitmap_vmask);
-				record_cutpoints_avx2(hashes_by_gather[inner_gather_i][3], mm_break_mark, zero_vec, high_bit_vec, cutpoint_bitmap_vmask);
-			}
-
-			if (!_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
-				alignas(32) uint32_t bitmap_words[LANE_COUNT];
-				_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
-				const uint64_t bitmap_batch_offset =
-					(file_data_offset + gather_i * sizeof(int32_t)) >> 3;
-				const uint64_t bitmap_bytes_per_lane = bytes_per_lane_without_overlap >> 3;
-				for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
-					const uint64_t bitmap_offset = bitmap_batch_offset + lane_i * bitmap_bytes_per_lane;
-					std::memcpy(cutpoint_bitmap + bitmap_offset, &bitmap_words[lane_i], sizeof(uint32_t));
-				}
-			}
-
-			cutpoint_bitmap_vmask = zero_vec;
-			gather_i += 8;
-		}
-
-		file_data_offset += window_bytes - GEAR_HASHLEN;
-		total_bytes_left -= window_bytes - GEAR_HASHLEN;
-	}
-
-	file_data_offset = file_data_offset >= GEAR_HASHLEN ? file_data_offset - GEAR_HASHLEN : 0;
-	uint32_t pattern = 0;
-	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
-		file_data_offset++;
-	}
-	while (file_data_offset < file_size) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
-		if (!(pattern & mask)) {
-			const uint32_t byte_pos = file_data_offset / 8u;
-			const uint8_t bit_pos = file_data_offset % 8u;
-			cutpoint_bitmap[byte_pos] = cutpoint_bitmap[byte_pos] | static_cast<uint8_t>(1u << bit_pos);
-		}
-		file_data_offset++;
-	}
+// AVX2 CDCZ phase one that replaces input gathers with contiguous lane loads and an 8x8 dword transpose.
+// Gear-table lookups retain the gather scheduling used by the optimization-level-one implementation.
+static void cdcz_chunking_phase_one_avx2_gear_with_load_transpose(
+	uint32_t mask,
+	uint64_t avg_block_size,
+	uint64_t min_block_size,
+	uint64_t max_block_size,
+	const unsigned char* RESTRICT file_data,
+	uint64_t file_size,
+	uint8_t* RESTRICT cutpoint_bitmap,
+	std::vector<uint64_t>& cutpoints
+) {
+	cdcz_chunking_phase_one_avx2_gear_scheduled_impl<true>(
+		mask, avg_block_size, min_block_size, max_block_size,
+		file_data, file_size, cutpoint_bitmap, cutpoints
+	);
 }
 #undef doGearAvx2
 #endif
@@ -1077,6 +1326,7 @@ static inline void load_and_transpose_16x8_epi32_avx512(
 // Gear-table lookups retain the gather scheduling used by the optimization-level-one implementation.
 static void cdcz_chunking_phase_one_avx512_gear_with_load_transpose(
 	uint32_t mask,
+	uint64_t,
 	uint64_t min_block_size,
 	uint64_t max_block_size,
 	const unsigned char* RESTRICT file_data,
@@ -1427,7 +1677,7 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 		return Chunking_Technique::chunk_file(file_path);
 	}
 
-	using phase_one_function = void (*)(uint32_t, uint64_t, uint64_t, const unsigned char*, uint64_t, uint8_t*, std::vector<uint64_t>&);
+	using phase_one_function = void (*)(uint32_t, uint64_t, uint64_t, uint64_t, const unsigned char*, uint64_t, uint8_t*, std::vector<uint64_t>&);
 	phase_one_function phase_one = nullptr;
 	switch (simd_mode) {
 	#if defined(__AVX2__)
@@ -1502,7 +1752,7 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 	auto begin_chunking = std::chrono::high_resolution_clock::now();
 	// mask was made for 64bits on the most significant bits, shift and cast to 32bit
 	uint32_t avg_mask = static_cast<uint32_t>(mask >> 32);
-	phase_one(avg_mask, min_block_size, max_block_size, file_data, file_size, cutpoint_bitmap, cutpoints);
+	phase_one(avg_mask, avg_block_size, min_block_size, max_block_size, file_data, file_size, cutpoint_bitmap, cutpoints);
 	auto end_chunking = std::chrono::high_resolution_clock::now();
 	total_time_chunking += (end_chunking - begin_chunking);
 
