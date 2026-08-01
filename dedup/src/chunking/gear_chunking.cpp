@@ -522,7 +522,6 @@ static void sscdc_chunking_phase_one_avx2_gear(uint32_t mask, uint64_t min_block
 	const __m256i mm_break_mark = _mm256_set1_epi32(mask);
 	const __m256i cmask = _mm256_set1_epi32(0xff);
 	const __m256i zero_vec = _mm256_setzero_si256();
-	const __m256i high_bit_vec = _mm256_set1_epi32(static_cast<int32_t>(1u << 31));
 	uint64_t file_data_offset = 0;
 	uint64_t total_bytes_left = file_size;
 
@@ -537,7 +536,6 @@ static void sscdc_chunking_phase_one_avx2_gear(uint32_t mask, uint64_t min_block
 		vindex = _mm256_mullo_epi32(vindex, _mm256_set1_epi32(bytes_per_lane_without_overlap));
 
 		__m256i hash = zero_vec;
-		__m256i cutpoint_bitmap_vmask = zero_vec;
 		const unsigned int gather_count = (bytes_per_lane / GEAR_HASHLEN) * 8;
 		for (int warmup_iter = 0; warmup_iter < 8; warmup_iter++) {
 			__m256i cbytes = _mm256_i32gather_epi32(
@@ -566,27 +564,21 @@ static void sscdc_chunking_phase_one_avx2_gear(uint32_t mask, uint64_t min_block
 						_mm256_and_si256(hash, mm_break_mark),
 						zero_vec
 					);
-					cutpoint_bitmap_vmask = _mm256_srli_epi32(cutpoint_bitmap_vmask, 1);
-					cutpoint_bitmap_vmask = _mm256_or_si256(
-						cutpoint_bitmap_vmask,
-						_mm256_and_si256(lane_cutpoint_mask, high_bit_vec)
+					uint32_t candidate_lanes = static_cast<uint32_t>(
+						_mm256_movemask_ps(_mm256_castsi256_ps(lane_cutpoint_mask))
 					);
+					while (candidate_lanes != 0) {
+						const uint32_t lane_i = _tzcnt_u32(candidate_lanes);
+						const uint64_t candidate_pos = file_data_offset
+							+ lane_i * bytes_per_lane_without_overlap
+							+ gather_i * sizeof(int32_t)
+							+ inner_gather_i * sizeof(int32_t)
+							+ j;
+						cutpoint_bitmap[candidate_pos >> 3] |= static_cast<uint8_t>(1u << (candidate_pos & 7));
+						candidate_lanes &= candidate_lanes - 1;
+					}
 				}
 			}
-
-			if (!_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
-				alignas(32) uint32_t bitmap_words[LANE_COUNT];
-				_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
-				const uint64_t bitmap_batch_offset =
-					(file_data_offset + gather_i * sizeof(int32_t)) >> 3;
-				const uint64_t bitmap_bytes_per_lane = bytes_per_lane_without_overlap >> 3;
-				for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
-					const uint64_t bitmap_offset = bitmap_batch_offset + lane_i * bitmap_bytes_per_lane;
-					std::memcpy(cutpoint_bitmap + bitmap_offset, &bitmap_words[lane_i], sizeof(uint32_t));
-				}
-			}
-
-			cutpoint_bitmap_vmask = zero_vec;
 			vindex = _mm256_add_epi32(vindex, _mm256_set1_epi32(GEAR_HASHLEN));
 			gather_i += 8;
 		}
