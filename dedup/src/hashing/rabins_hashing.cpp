@@ -1,6 +1,7 @@
 #include "rabins_hashing.hpp"
 
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 
 Rabins_Hashing::Rabins_Hashing() {
     poly = FINGERPRINT_PT;
@@ -10,13 +11,14 @@ Rabins_Hashing::Rabins_Hashing() {
 void Rabins_Hashing::init(int window_size) {
 
     this->window_size = window_size;
-    circbuf = (unsigned char *)malloc(window_size * sizeof(unsigned char));
+    circbuf = static_cast<unsigned char *>(
+        std::malloc(window_size * sizeof(unsigned char)));
     fingerprint = 0;
     circbuf_pos = -1;
-    bzero((char *)circbuf, window_size * sizeof(unsigned char));
+    std::memset(circbuf, 0, window_size * sizeof(unsigned char));
 }
 
-u_int64_t Rabins_Hashing::polymod(u_int64_t nh, u_int64_t nl, u_int64_t d) {
+uint64_t Rabins_Hashing::polymod(uint64_t nh, uint64_t nl, uint64_t d) {
     int i;
     int k = fls64(d) - 1;
     d <<= 63 - k;
@@ -24,7 +26,7 @@ u_int64_t Rabins_Hashing::polymod(u_int64_t nh, u_int64_t nl, u_int64_t d) {
     if (nh) {
         if (nh & MSB64) nh ^= d;  // XXX unreachable? (on 32 bit platform?)
         for (i = 62; i >= 0; i--)
-            if (nh & ((u_int64_t)1) << i) {
+            if (nh & ((uint64_t)1) << i) {
                 nh ^= d >> (63 - i);
                 nl ^= d << (i + 1);
             }
@@ -35,10 +37,10 @@ u_int64_t Rabins_Hashing::polymod(u_int64_t nh, u_int64_t nl, u_int64_t d) {
     return nl;
 }
 
-void Rabins_Hashing::polymult(u_int64_t *php, u_int64_t *plp, u_int64_t x,
-                              u_int64_t y) {
+void Rabins_Hashing::polymult(uint64_t *php, uint64_t *plp, uint64_t x,
+                              uint64_t y) {
     int i;
-    u_int64_t ph = 0, pl = 0;
+    uint64_t ph = 0, pl = 0;
     if (x & 1) pl = y;
     for (i = 1; i < 64; i++)
         if (x & (INT64(1) << i)) {
@@ -49,8 +51,8 @@ void Rabins_Hashing::polymult(u_int64_t *php, u_int64_t *plp, u_int64_t x,
     if (plp) *plp = pl;
 }
 
-u_int64_t Rabins_Hashing::polymmult(u_int64_t x, u_int64_t y, u_int64_t d) {
-    u_int64_t h, l;
+uint64_t Rabins_Hashing::polymmult(uint64_t x, uint64_t y, uint64_t d) {
+    uint64_t h, l;
     polymult(&h, &l, x, y);
     return polymod(h, l, d);
 }
@@ -61,12 +63,12 @@ void Rabins_Hashing::calcT() {
     int xshift = fls64(poly) - 1;
     shift = xshift - 8;
 
-    u_int64_t T1 = polymod(0, INT64(1) << xshift, poly);
+    uint64_t T1 = polymod(0, INT64(1) << xshift, poly);
     for (i = 0; i < 256; i++) {
-        T[i] = polymmult(i, T1, poly) | ((u_int64_t)i << xshift);
+        T[i] = polymmult(i, T1, poly) | ((uint64_t)i << xshift);
     }
 
-    u_int64_t sizeshift = 1;
+    uint64_t sizeshift = 1;
     for (i = 1; i < window_size; i++) {
         sizeshift = append8(sizeshift, 0);
     }
@@ -76,7 +78,7 @@ void Rabins_Hashing::calcT() {
     }
 }
 
-u_int64_t Rabins_Hashing::slide8(unsigned char m) {
+uint64_t Rabins_Hashing::slide8(unsigned char m) {
 
     circbuf_pos++;
     if (circbuf_pos >= window_size) {
@@ -87,7 +89,7 @@ u_int64_t Rabins_Hashing::slide8(unsigned char m) {
     return fingerprint = append8(fingerprint ^ U[om], m);
 }
 
-u_int64_t Rabins_Hashing::append8(u_int64_t p, unsigned char m) {
+uint64_t Rabins_Hashing::append8(uint64_t p, unsigned char m) {
 
     return ((p << 8) | m) ^ T[p >> shift];
 }

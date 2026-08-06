@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 extern bool disable_hashing;
@@ -79,6 +80,26 @@ void File_Chunk::print() const {
 
 // ========== Chunking_Techniques =============
 
+bool Chunking_Technique::read_exact(std::istream& stream, char* buffer,
+                                    uint64_t byte_count) {
+    constexpr uint64_t max_read_size = 64ull * 1024 * 1024;
+    uint64_t total_bytes_read = 0;
+
+    while (total_bytes_read < byte_count) {
+        const uint64_t bytes_remaining = byte_count - total_bytes_read;
+        const auto bytes_to_read = static_cast<std::streamsize>(
+            std::min(max_read_size, bytes_remaining));
+        stream.read(buffer + total_bytes_read, bytes_to_read);
+        const std::streamsize bytes_read = stream.gcount();
+        if (bytes_read != bytes_to_read) {
+            return false;
+        }
+        total_bytes_read += static_cast<uint64_t>(bytes_read);
+    }
+
+    return true;
+}
+
 uint64_t Chunking_Technique::get_file_size(std::istream* file_ptr) {
     file_ptr->seekg(0, std::ios_base::end);
     uint64_t file_size = file_ptr->tellg();
@@ -104,8 +125,10 @@ std::unique_ptr<std::istream> Chunking_Technique::read_file_to_buffer(std::strin
     uint64_t bytes_to_read = std::min(buffer_size, length);
     while (curr_bytes_read < length) {
         // read data from file into the buffer
-        file_ptr.read(buffer.get(), bytes_to_read);
-        ss->write(buffer.get(), bytes_to_read);
+        if (!read_exact(file_ptr, buffer.get(), bytes_to_read)) {
+            throw std::runtime_error("Failed to read complete file: " + file_path);
+        }
+        ss->write(buffer.get(), static_cast<std::streamsize>(bytes_to_read));
         curr_bytes_read += bytes_to_read;
         bytes_to_read = std::min(buffer_size, length - curr_bytes_read);
     }
@@ -119,7 +142,7 @@ std::unique_ptr<std::istream> Chunking_Technique::read_file_to_buffer(std::strin
 std::vector<std::string> Chunking_Technique::chunk_file(std::string file_path) {
     std::vector<std::string> hashes;
     std::ifstream file_ptr;
-    file_ptr.open(file_path, std::ios::in);
+    file_ptr.open(file_path, std::ios::in | std::ios::binary);
     chunk_stream(hashes, file_ptr);
     return hashes;
 }
@@ -155,7 +178,7 @@ void Chunking_Technique::chunk_stream(std::vector<std::string>& hashes,
         buffer_size = this->stream_buffer_size;
     }
     int64_t bytes_left = get_file_size(&stream);
-    buffer.reserve(buffer_size);
+    buffer.resize(buffer_size);
     // initial chunk_size to allow the read of full buffer size
     int64_t chunk_size = buffer_size;
     // logical buffer end

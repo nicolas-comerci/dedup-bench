@@ -44,7 +44,7 @@ To quickly get started, run the following commands on Ubuntu:
 ```
   git clone git@github.com:UWASL/dedup-bench.git
   cd dedup-bench/
-  sh ./install.sh
+  ./install.sh
 ```
   
 
@@ -56,6 +56,28 @@ To quickly get started, run the following commands on Ubuntu:
 ```
 
 This should generate graphs titled _results_graph.png_ similar to the one below. Note that the space savings will be zero for all algorithms, as the default run uses the random dataset. 
+
+## Native Windows with MSYS2 UCRT64
+
+DedupBench can use the same Bash workflow on Windows while compiling and running
+native Windows executables. Install [MSYS2](https://www.msys2.org/), update it
+with `pacman -Suy` (restart the terminal and repeat if requested), and open the
+**MSYS2 UCRT64** terminal. Do not use Git Bash or the plain MSYS terminal.
+
+From the UCRT64 terminal, clone or enter the repository on the Windows drive and
+run the usual commands:
+
+```
+  ./install.sh
+  cd build/
+  ./dedup_script.sh -c unaccelerated_8kb random_dataset
+  python3 plot_results.py results.txt
+```
+
+`install.sh` installs the UCRT64 GCC, OpenSSL, xxHash, Python, and plotting
+packages through `pacman`, then offers the same unaccelerated, AVX-256, and
+AVX-512 build choices as Linux. Bash and Make only orchestrate the workflow;
+`dedup.exe` and the measurement programs are native Windows/UCRT64 binaries.
 
 To see a real dataset in action and generate the graph below, download and use the _DEB_ dataset used in our Middleware 2024 / FAST 2025 papers from [💾 VM Images Dataset](https://www.kaggle.com/datasets/sreeharshau/vm-deb-fast25). This graph is from an AMD EPYC Rome machine.
 
@@ -244,4 +266,3 @@ Note that the following images were also used in the paper but are unavailable a
 # How do I figure out the right parameter values for SeqCDC?
 
 We have added a detailed parameter search procedure to `supporting_tools/seqcdc-parameter-search/README.md`. Related scripts can be found in the same directory.
-

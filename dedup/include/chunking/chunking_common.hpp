@@ -33,6 +33,14 @@ class Chunking_Technique{
 
     protected:
         /**
+         * Read exactly byte_count bytes into a preallocated buffer using
+         * bounded requests that are safe across supported standard-library
+         * implementations.
+         */
+        static bool read_exact(std::istream& stream, char* buffer,
+                               uint64_t byte_count);
+
+        /**
          * @brief a helper function to create a chunk from a data buffer
          * @param file_chunks: chunks vector
          * @param data: the data buffer

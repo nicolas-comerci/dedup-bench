@@ -117,6 +117,7 @@ for technique in "${TECHNIQUES[@]}"; do
       fi
       echo "fastcdc_normalization_level = 2"
       echo "fastcdc_disable_normalization = false"
+      echo "use_64bit_gear = false"
     elif [[ "$technique" == "gear" ]]; then
       if [ ! -z "$MIN_SIZE" ]; then
         echo "gear_min_block_size = $MIN_SIZE"
@@ -124,6 +125,7 @@ for technique in "${TECHNIQUES[@]}"; do
         echo "gear_min_block_size = $(($AVG_SIZE / 4))"
       fi
       echo "gear_avg_block_size = $AVG_SIZE"
+      echo "use_64bit_gear = false"
       if [ ! -z "$MAX_SIZE" ]; then
         echo "gear_max_block_size = $MAX_SIZE"
       else

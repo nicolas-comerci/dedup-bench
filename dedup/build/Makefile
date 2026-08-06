@@ -12,15 +12,24 @@ INCLUDE_PATH = ../include/
 INCLUDE_PATH_CHUNKING = ../include/chunking
 INCLUDE_PATH_HASHING = ../include/hashing
 INCLUDE_PATH_CONFIG = ../include/config
+ifeq ($(OS),Windows_NT)
+# UCRT64 GCC searches /ucrt64/include and /ucrt64/lib by default.
+INCLUDE_PATH_OPENSSL =
+OPENSSL_LIBRARY_PATH =
+else
 INCLUDE_PATH_OPENSSL = /usr/local/opt/openssl@3/include
+OPENSSL_LIBRARY_PATH = -L /usr/local/opt/openssl@3/lib
+endif
 
 INCLUDE_FLAGS = -I $(INCLUDE_PATH)
 INCLUDE_FLAGS += -I ${INCLUDE_PATH_CHUNKING}
 INCLUDE_FLAGS += -I ${INCLUDE_PATH_HASHING}
 INCLUDE_FLAGS += -I ${INCLUDE_PATH_CONFIG}
+ifneq ($(strip $(INCLUDE_PATH_OPENSSL)),)
 INCLUDE_FLAGS += -I ${INCLUDE_PATH_OPENSSL}
+endif
 
-LD_FLAGS = -L /usr/local/opt/openssl@3/lib -lcrypto -lxxhash
+LD_FLAGS = $(OPENSSL_LIBRARY_PATH) -lcrypto -lxxhash
 
 SRC_PATH = ../src
 SRC_MAIN = $(wildcard $(SRC_PATH)/*.cpp)
@@ -50,8 +59,9 @@ DEPS_CONFIG = $(wildcard $(INCLUDE_PATH_CONFIG)/*.hpp)
 
 # 	For everything except AVX-512, pass '-msse -msse2 -msse3 -msse4.1 -mavx -mavx2 -mbmi -mbmi2' as EXTRA_COMPILER_FLAGS
 
-COMPILER_FLAGS= -std=c++17 -Wall -Wextra -Wno-format -O3 -DNDEBUG -Wno-implicit-fallthrough ${EXTRA_COMPILER_FLAGS}
-#COMPILER_FLAGS= -std=c++17 -Wall -Wextra -Wno-format -g -Wno-implicit-fallthrough ${EXTRA_COMPILER_FLAGS}
+TUNING_FLAGS ?= -mtune=native
+COMPILER_FLAGS= -std=c++17 -Wall -Wextra -Wno-format -O3 -DNDEBUG -Wno-implicit-fallthrough $(TUNING_FLAGS) ${EXTRA_COMPILER_FLAGS}
+#COMPILER_FLAGS= -std=c++17 -Wall -Wextra -Wno-format -g -Wno-implicit-fallthrough $(TUNING_FLAGS) ${EXTRA_COMPILER_FLAGS}
 
 CC = g++
 RM = rm -f
