@@ -83,7 +83,7 @@ static void driver_function(const std::filesystem::path& dir_path,
         }
 
         std::ifstream file_ptr;
-        file_ptr.open(file_path, std::ios::in);
+        file_ptr.open(file_path, std::ios::in | std::ios::binary);
         if (!file_ptr.is_open()) {
             std::cerr << "Failed to open " << file_path << " for reading"
                       << std::endl;
@@ -91,7 +91,7 @@ static void driver_function(const std::filesystem::path& dir_path,
         }
         // Chunk file using specified Chunking_Technique
         std::vector<std::string> hashes =
-            chunk_method->chunk_file(file_path);
+            chunk_method->chunk_file(file_path.string());
         // get the size of the file
         total_bytes += chunk_method->get_file_size(&file_ptr);
         chunk_count += hashes.size();

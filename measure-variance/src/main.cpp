@@ -3,6 +3,7 @@
 #include <set>
 #include <string>
 #include <iomanip>
+#include <cstdint>
 
 
 int main(int argc, char * argv[]){

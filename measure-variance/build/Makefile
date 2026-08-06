@@ -10,7 +10,8 @@ SRC_PATH = ../src
 SRC_MAIN = $(wildcard $(SRC_PATH)/*.cpp)
 OBJS_MAIN = $(SRC_MAIN:$(SRC_PATH)/%.cpp=%.o)
 
-COMPILER_FLAGS= -std=c++17 -Wall -Wextra -Wno-format
+TUNING_FLAGS ?= -mtune=native
+COMPILER_FLAGS= -std=c++17 -Wall -Wextra -Wno-format $(TUNING_FLAGS)
 
 CC = g++ -g
 RM = rm -f

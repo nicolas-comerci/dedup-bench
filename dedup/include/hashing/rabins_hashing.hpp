@@ -1,6 +1,7 @@
 #pragma once
 #ifndef _RABINS_HASHING_
 #define _RABINS_HASHING_
+#include <cstdint>
 #include <iostream>
 
 #define INT64(n) n##LL
@@ -12,7 +13,7 @@
 #define FINGERPRINT_PT 0xbfe6b8a5bf378d83LL
 
 // Declaring and defining functions in header to allow it be used within TTTD Chunking without needing a local reimplementation
-inline u_int32_t fls32(u_int32_t num) {
+inline uint32_t fls32(uint32_t num) {
     /**
     @brief find last set bit in a 32-bit number
     @param num: the number to operate on
@@ -44,18 +45,18 @@ inline u_int32_t fls32(u_int32_t num) {
     return r;
 }
 
-inline char fls64(u_int64_t num) {
+inline char fls64(uint64_t num) {
     /**
     @brief find last set bit in a 64-bit number
     @param num: the number to operate on
 
     @return: last set bit in a 64-bit number
     */
-    u_int32_t h;
+    uint32_t h;
     if ((h = num >> 32))
         return 32 + fls32(h);
     else
-        return fls32((u_int32_t)num);
+        return fls32((uint32_t)num);
 }
 
 
@@ -65,11 +66,11 @@ class Rabins_Hashing {
      *
      */
    private:
-    u_int64_t poly;  // Actual polynomial
+    uint64_t poly;  // Actual polynomial
     int shift;
-    u_int64_t T[256];      // Lookup table for mod
-    u_int64_t U[256];      // Lookup table for mod
-    u_int64_t window_size;  // sl
+    uint64_t T[256];      // Lookup table for mod
+    uint64_t U[256];      // Lookup table for mod
+    uint64_t window_size;  // sl
 
     unsigned char *circbuf;    // circular buffer of size 'window_size'
     unsigned int circbuf_pos;  // current position in circular buffer
@@ -80,28 +81,28 @@ class Rabins_Hashing {
      * initialization.
      */
     void calcT();
-    u_int64_t polymod(u_int64_t nh, u_int64_t nl, u_int64_t d);
+    uint64_t polymod(uint64_t nh, uint64_t nl, uint64_t d);
 
-    void polymult(u_int64_t *php, u_int64_t *plp, u_int64_t x, u_int64_t y);
+    void polymult(uint64_t *php, uint64_t *plp, uint64_t x, uint64_t y);
 
-    u_int64_t polymmult(u_int64_t x, u_int64_t y, u_int64_t d);
+    uint64_t polymmult(uint64_t x, uint64_t y, uint64_t d);
 
     /**
      * @brief helper function to append the mod value from U table. to help add
      * more randomization to the fingerprint.
      * @return the current fingerprint
      */
-    u_int64_t append8(u_int64_t p, unsigned char m);
+    uint64_t append8(uint64_t p, unsigned char m);
 
    public:
-    u_int64_t fingerprint;  // current rabin fingerprint
+    uint64_t fingerprint;  // current rabin fingerprint
 
     /**
      * @brief Feed a new byte into the rabin sliding window and update the rabin
      *       fingerprint.
      * @return the current fingerprint
      */
-    u_int64_t slide8(unsigned char m);
+    uint64_t slide8(unsigned char m);
 
     /**
      *   @brief initlize the internal varibles. call after each file to reset

@@ -1,3 +1,4 @@
+
 /**
  * @file gear_chunking.cpp
  * @author WASL
@@ -19,10 +20,17 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <stdexcept>
+
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 
 #include <immintrin.h>
 
 #include "compiler_compat.hpp"
+#include "config_error.hpp"
+#include "gear_common.hpp"
 
 extern bool disable_hashing;
 
@@ -45,51 +53,16 @@ Gear_Chunking::Gear_Chunking(const Config& config) {
     }
 
     simd_mode = config.get_simd_mode();
+	use_64bit_gear = config.get_use_64bit_gear();
+	if (simd_mode != SIMD_Mode::NONE && use_64bit_gear) {
+		throw ConfigError("64-bit Gear is unsupported for SSCDC");
+	}
 	optimization_level = config.get_sscdc_optimization_level();
 }
 
-uint64_t Gear_Chunking::ghash(uint64_t h, unsigned char ch) {
-    return ((h << 1) + GEAR_TABLE[ch]);
-}
-
-alignas(64) static const uint32_t crct[256] =
-{
-	0x00000000,0x77073096,0xEE0E612C,0x990951BA,0x076DC419,0x706AF48F,0xE963A535,0x9E6495A3,
-	0x0EDB8832,0x79DCB8A4,0xE0D5E91E,0x97D2D988,0x09B64C2B,0x7EB17CBD,0xE7B82D07,0x90BF1D91,
-	0x1DB71064,0x6AB020F2,0xF3B97148,0x84BE41DE,0x1ADAD47D,0x6DDDE4EB,0xF4D4B551,0x83D385C7,
-	0x136C9856,0x646BA8C0,0xFD62F97A,0x8A65C9EC,0x14015C4F,0x63066CD9,0xFA0F3D63,0x8D080DF5,
-	0x3B6E20C8,0x4C69105E,0xD56041E4,0xA2677172,0x3C03E4D1,0x4B04D447,0xD20D85FD,0xA50AB56B,
-	0x35B5A8FA,0x42B2986C,0xDBBBC9D6,0xACBCF940,0x32D86CE3,0x45DF5C75,0xDCD60DCF,0xABD13D59,
-	0x26D930AC,0x51DE003A,0xC8D75180,0xBFD06116,0x21B4F4B5,0x56B3C423,0xCFBA9599,0xB8BDA50F,
-	0x2802B89E,0x5F058808,0xC60CD9B2,0xB10BE924,0x2F6F7C87,0x58684C11,0xC1611DAB,0xB6662D3D,
-	0x76DC4190,0x01DB7106,0x98D220BC,0xEFD5102A,0x71B18589,0x06B6B51F,0x9FBFE4A5,0xE8B8D433,
-	0x7807C9A2,0x0F00F934,0x9609A88E,0xE10E9818,0x7F6A0DBB,0x086D3D2D,0x91646C97,0xE6635C01,
-	0x6B6B51F4,0x1C6C6162,0x856530D8,0xF262004E,0x6C0695ED,0x1B01A57B,0x8208F4C1,0xF50FC457,
-	0x65B0D9C6,0x12B7E950,0x8BBEB8EA,0xFCB9887C,0x62DD1DDF,0x15DA2D49,0x8CD37CF3,0xFBD44C65,
-	0x4DB26158,0x3AB551CE,0xA3BC0074,0xD4BB30E2,0x4ADFA541,0x3DD895D7,0xA4D1C46D,0xD3D6F4FB,
-	0x4369E96A,0x346ED9FC,0xAD678846,0xDA60B8D0,0x44042D73,0x33031DE5,0xAA0A4C5F,0xDD0D7CC9,
-	0x5005713C,0x270241AA,0xBE0B1010,0xC90C2086,0x5768B525,0x206F85B3,0xB966D409,0xCE61E49F,
-	0x5EDEF90E,0x29D9C998,0xB0D09822,0xC7D7A8B4,0x59B33D17,0x2EB40D81,0xB7BD5C3B,0xC0BA6CAD,
-	0xEDB88320,0x9ABFB3B6,0x03B6E20C,0x74B1D29A,0xEAD54739,0x9DD277AF,0x04DB2615,0x73DC1683,
-	0xE3630B12,0x94643B84,0x0D6D6A3E,0x7A6A5AA8,0xE40ECF0B,0x9309FF9D,0x0A00AE27,0x7D079EB1,
-	0xF00F9344,0x8708A3D2,0x1E01F268,0x6906C2FE,0xF762575D,0x806567CB,0x196C3671,0x6E6B06E7,
-	0xFED41B76,0x89D32BE0,0x10DA7A5A,0x67DD4ACC,0xF9B9DF6F,0x8EBEEFF9,0x17B7BE43,0x60B08ED5,
-	0xD6D6A3E8,0xA1D1937E,0x38D8C2C4,0x4FDFF252,0xD1BB67F1,0xA6BC5767,0x3FB506DD,0x48B2364B,
-	0xD80D2BDA,0xAF0A1B4C,0x36034AF6,0x41047A60,0xDF60EFC3,0xA867DF55,0x316E8EEF,0x4669BE79,
-	0xCB61B38C,0xBC66831A,0x256FD2A0,0x5268E236,0xCC0C7795,0xBB0B4703,0x220216B9,0x5505262F,
-	0xC5BA3BBE,0xB2BD0B28,0x2BB45A92,0x5CB36A04,0xC2D7FFA7,0xB5D0CF31,0x2CD99E8B,0x5BDEAE1D,
-	0x9B64C2B0,0xEC63F226,0x756AA39C,0x026D930A,0x9C0906A9,0xEB0E363F,0x72076785,0x05005713,
-	0x95BF4A82,0xE2B87A14,0x7BB12BAE,0x0CB61B38,0x92D28E9B,0xE5D5BE0D,0x7CDCEFB7,0x0BDBDF21,
-	0x86D3D2D4,0xF1D4E242,0x68DDB3F8,0x1FDA836E,0x81BE16CD,0xF6B9265B,0x6FB077E1,0x18B74777,
-	0x88085AE6,0xFF0F6A70,0x66063BCA,0x11010B5C,0x8F659EFF,0xF862AE69,0x616BFFD3,0x166CCF45,
-	0xA00AE278,0xD70DD2EE,0x4E048354,0x3903B3C2,0xA7672661,0xD06016F7,0x4969474D,0x3E6E77DB,
-	0xAED16A4A,0xD9D65ADC,0x40DF0B66,0x37D83BF0,0xA9BCAE53,0xDEBB9EC5,0x47B2CF7F,0x30B5FFE9,
-	0xBDBDF21C,0xCABAC28A,0x53B39330,0x24B4A3A6,0xBAD03605,0xCDD70693,0x54DE5729,0x23D967BF,
-	0xB3667A2E,0xC4614AB8,0x5D681B02,0x2A6F2B94,0xB40BBE37,0xC30C8EA1,0x5A05DF1B,0x2D02EF8D,
-};
 
 static inline void doGear_serial(uint8_t c, uint32_t* x) {
-	*x = (*x << 1) + crct[c];
+	*x = (*x << 1) + gear_common::table_32[c];
 }
 
 #ifndef _MSC_VER
@@ -140,10 +113,10 @@ static void sscdc_chunking_phase_one_serial_gear(uint32_t mask, uint64_t min_blo
 	uint64_t curr_pos = 0;
 	uint32_t hash = 0;
 	for (; curr_pos < GEAR_HASHLEN; curr_pos++) {
-		hash = (hash << 1) + crct[file_data[curr_pos]];
+		hash = (hash << 1) + gear_common::table_32[file_data[curr_pos]];
 	}
 	for (; curr_pos < file_size; curr_pos++) {
-		hash = (hash << 1) + crct[file_data[curr_pos]];
+		hash = (hash << 1) + gear_common::table_32[file_data[curr_pos]];
 		if (!(hash & mask)) {
 			uint8_t bits = cutpoint_bitmap[curr_pos / 8];  // get bits for block of 8 bytes
 			bits |= 1 << (curr_pos % 8);  // set appropriate bit
@@ -158,7 +131,7 @@ static void sscdc_chunking_phase_one_serial_gear(uint32_t mask, uint64_t min_blo
 					hash = _mm512_slli_epi32(hash, 1);\
 					__m512i idx = _mm512_and_epi32(cbytes, cmask);\
 					cbytes = _mm512_srli_epi32(cbytes, 8);\
-					__m512i tentry = _mm512_i32gather_epi32(idx, crct, 4);\
+					__m512i tentry = _mm512_i32gather_epi32(idx, gear_common::table_32, 4);\
 					hash = _mm512_add_epi32(hash, tentry);}
 
 // Code adapted from NetApp's SSCDC repo
@@ -193,6 +166,7 @@ static void sscdc_chunking_phase_one_avx512_gear(uint32_t mask, uint64_t min_blo
 		__m512i cutpoint_bitmap_vmask = zero_vec;
 		// We know exactly how many Gathers we will need to process all data in the window as each Gather gets 32bits/4bytes of data
 		// per lane, and bytes_per_lane is divisible by GEAR_HASHLEN=8 Gather instructions.
+
 		const unsigned int gather_count = (bytes_per_lane / GEAR_HASHLEN) * 8;
 		// First do the "warmup" so each lane gets the valid GEAR hash pattern after the overlap with the previous lane's data
 		// ( for the first lane on the first segment we assume the minimum chunk size >= GEAR_HASHLEN )
@@ -252,12 +226,12 @@ static void sscdc_chunking_phase_one_avx512_gear(uint32_t mask, uint64_t min_blo
 	uint32_t pattern = 0;
 	// "Regenerate" the gear hash so we can continue with leftover data as if we didn't separate the processing
 	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		file_data_offset++;
 	}
 	// Finish the remaining data and add results to the cutpoint_bitmap
 	while (file_data_offset < file_size) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		if (!(pattern & mask)) {
 			const uint32_t byte_pos = file_data_offset / 8u;
 			const uint8_t bit_pos = file_data_offset % 8u;
@@ -280,10 +254,10 @@ static inline void gather_gear_entries_avx512(
 	const __m512i idx2 = _mm512_and_epi32(_mm512_srli_epi32(cbytes, 16), byte_mask);
 	const __m512i idx3 = _mm512_srli_epi32(cbytes, 24);
 
-	tentry0 = _mm512_i32gather_epi32(idx0, crct, 4);
-	tentry1 = _mm512_i32gather_epi32(idx1, crct, 4);
-	tentry2 = _mm512_i32gather_epi32(idx2, crct, 4);
-	tentry3 = _mm512_i32gather_epi32(idx3, crct, 4);
+	tentry0 = _mm512_i32gather_epi32(idx0, gear_common::table_32, 4);
+	tentry1 = _mm512_i32gather_epi32(idx1, gear_common::table_32, 4);
+	tentry2 = _mm512_i32gather_epi32(idx2, gear_common::table_32, 4);
+	tentry3 = _mm512_i32gather_epi32(idx3, gear_common::table_32, 4);
 }
 
 static inline void roll_gear_avx512(__m512i& hash, __m512i tentry) {
@@ -393,6 +367,7 @@ static void sscdc_chunking_phase_one_avx512_gear_with_gather_scheduling(uint32_t
 				_mm512_mask_i32scatter_epi32(
 					cutpoint_bitmap + cutpoint_bitmap_offset,
 					lanes_with_results_mask,
+
 					cutpoint_bitmap_vindex,
 					cutpoint_bitmap_vmask,
 					1
@@ -413,12 +388,12 @@ static void sscdc_chunking_phase_one_avx512_gear_with_gather_scheduling(uint32_t
 	uint32_t pattern = 0;
 	// "Regenerate" the gear hash so we can continue with leftover data as if we didn't separate the processing
 	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		file_data_offset++;
 	}
 	// Finish the remaining data and add results to the cutpoint_bitmap
 	while (file_data_offset < file_size) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		if (!(pattern & mask)) {
 			const uint32_t byte_pos = file_data_offset / 8u;
 			const uint8_t bit_pos = file_data_offset % 8u;
@@ -434,7 +409,7 @@ static void sscdc_chunking_phase_one_avx512_gear_with_gather_scheduling(uint32_t
 					hash = _mm256_slli_epi32(hash, 1);\
 					__m256i idx = _mm256_and_si256(cbytes, cmask);\
 					cbytes = _mm256_srli_epi32(cbytes, 8);\
-					__m256i tentry = _mm256_i32gather_epi32(reinterpret_cast<const int*>(crct), idx, 4);\
+					__m256i tentry = _mm256_i32gather_epi32(reinterpret_cast<const int*>(gear_common::table_32), idx, 4);\
 					hash = _mm256_add_epi32(hash, tentry);}
 
 static inline void gather_gear_entries_avx2(
@@ -449,10 +424,10 @@ static inline void gather_gear_entries_avx2(
 	const __m256i idx2 = _mm256_and_si256(_mm256_srli_epi32(cbytes, 16), byte_mask);
 	const __m256i idx3 = _mm256_srli_epi32(cbytes, 24);
 
-	tentry0 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(crct), idx0, 4);
-	tentry1 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(crct), idx1, 4);
-	tentry2 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(crct), idx2, 4);
-	tentry3 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(crct), idx3, 4);
+	tentry0 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(gear_common::table_32), idx0, 4);
+	tentry1 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(gear_common::table_32), idx1, 4);
+	tentry2 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(gear_common::table_32), idx2, 4);
+	tentry3 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(gear_common::table_32), idx3, 4);
 }
 
 static inline void roll_gear_avx2(__m256i& hash, __m256i tentry) {
@@ -590,11 +565,12 @@ static void sscdc_chunking_phase_one_avx2_gear(uint32_t mask, uint64_t min_block
 	file_data_offset = file_data_offset >= GEAR_HASHLEN ? file_data_offset - GEAR_HASHLEN : 0;
 	uint32_t pattern = 0;
 	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		file_data_offset++;
 	}
+
 	while (file_data_offset < file_size) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		if (!(pattern & mask)) {
 			const uint32_t byte_pos = file_data_offset / 8u;
 			const uint8_t bit_pos = file_data_offset % 8u;
@@ -707,11 +683,11 @@ static void sscdc_chunking_phase_one_avx2_gear_with_gather_scheduling(uint32_t m
 	file_data_offset = file_data_offset >= GEAR_HASHLEN ? file_data_offset - GEAR_HASHLEN : 0;
 	uint32_t pattern = 0;
 	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		file_data_offset++;
 	}
 	while (file_data_offset < file_size) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		if (!(pattern & mask)) {
 			const uint32_t byte_pos = file_data_offset / 8u;
 			const uint8_t bit_pos = file_data_offset % 8u;
@@ -793,6 +769,7 @@ static void sscdc_chunking_phase_one_avx2_gear_with_load_transpose(uint32_t mask
 				record_cutpoints_avx2(hashes_by_gather[inner_gather_i][3], mm_break_mark, zero_vec, high_bit_vec, cutpoint_bitmap_vmask);
 			}
 
+
 			if (!_mm256_testz_si256(cutpoint_bitmap_vmask, cutpoint_bitmap_vmask)) {
 				alignas(32) uint32_t bitmap_words[LANE_COUNT];
 				_mm256_store_si256(reinterpret_cast<__m256i*>(bitmap_words), cutpoint_bitmap_vmask);
@@ -816,11 +793,11 @@ static void sscdc_chunking_phase_one_avx2_gear_with_load_transpose(uint32_t mask
 	file_data_offset = file_data_offset >= GEAR_HASHLEN ? file_data_offset - GEAR_HASHLEN : 0;
 	uint32_t pattern = 0;
 	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		file_data_offset++;
 	}
 	while (file_data_offset < file_size) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		if (!(pattern & mask)) {
 			const uint32_t byte_pos = file_data_offset / 8u;
 			const uint8_t bit_pos = file_data_offset % 8u;
@@ -993,6 +970,7 @@ static void sscdc_chunking_phase_one_avx512_gear_with_load_transpose(uint32_t ma
 				_mm512_mask_i32scatter_epi32(
 					cutpoint_bitmap + cutpoint_bitmap_offset,
 					lanes_with_results_mask,
+
 					cutpoint_bitmap_vindex,
 					cutpoint_bitmap_vmask,
 					1
@@ -1011,11 +989,11 @@ static void sscdc_chunking_phase_one_avx512_gear_with_load_transpose(uint32_t ma
 	file_data_offset = file_data_offset >= GEAR_HASHLEN ? file_data_offset - GEAR_HASHLEN : 0;
 	uint32_t pattern = 0;
 	for (int j = 0; j < GEAR_HASHLEN && file_data_offset < file_size; j++) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		file_data_offset++;
 	}
 	while (file_data_offset < file_size) {
-		pattern = (pattern << 1) + crct[file_data[file_data_offset]];
+		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		if (!(pattern & mask)) {
 			const uint32_t byte_pos = file_data_offset / 8u;
 			const uint8_t bit_pos = file_data_offset % 8u;
@@ -1193,6 +1171,7 @@ static void next_chunk_serial(uint64_t min_block_size, uint64_t max_block_size, 
 				break;
 			}
 			current_chunk_size++;
+
 		}
 	}
 }
@@ -1280,11 +1259,21 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 	}
 
 	std::ifstream file_ptr;
-	file_ptr.open(file_path, std::ios::in);
+	file_ptr.open(file_path, std::ios::in | std::ios::binary);
+	if (!file_ptr.is_open()) {
+		throw std::runtime_error("Failed to open file: " + file_path);
+	}
 
 	file_ptr.seekg(0, std::ios_base::end);
-	file_size = file_ptr.tellg();
+	const std::streampos end_position = file_ptr.tellg();
+	if (end_position < 0) {
+		throw std::runtime_error("Failed to determine file size: " + file_path);
+	}
+	file_size = static_cast<uint64_t>(end_position);
 	file_ptr.seekg(0, std::ios_base::beg);
+	if (!file_ptr) {
+		throw std::runtime_error("Failed to seek file: " + file_path);
+	}
 
 	const auto bitmap_size = (file_size + 7) / 8 + HASHLEN / 8;
 	if (cutpoint_bitmap) {
@@ -1307,7 +1296,9 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 		exit(2);
 	}
 	unsigned char* const file_data = file_data_owner.get();
-	file_ptr.read(reinterpret_cast<char*>(file_data), file_size);
+	if (!read_exact(file_ptr, reinterpret_cast<char*>(file_data), file_size)) {
+		throw std::runtime_error("Failed to read complete file: " + file_path);
+	}
 
 	auto begin_chunking = std::chrono::high_resolution_clock::now();
 	// mask was made for 64bits on the most significant bits, shift and cast to 32bit
@@ -1325,7 +1316,7 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 		auto debug_curr_pos = prev_cut_offset;
 		uint32_t hash = 0;
 		for (; debug_curr_pos < file_size; debug_curr_pos++) {
-			hash = (hash << 1) + crct[file_data[debug_curr_pos]];
+			hash = (hash << 1) + gear_common::table_32[file_data[debug_curr_pos]];
 			if (!(hash & avg_mask) && (debug_curr_pos - prev_cut_offset >= min_block_size)) {
 				break;
 			}
@@ -1377,41 +1368,46 @@ uint64_t Gear_Chunking::find_cutpoint(char* data, uint64_t size) {
 }
 
 uint64_t Gear_Chunking::find_cutpoint_serial(char* data, uint64_t size) {
-  uint64_t hash = 0;
-  uint64_t idx = min_block_size;
+  uint64_t idx = 0;
 
   // If given data is lower than the minimum chunk size, return data length.
+
   if (size <= min_block_size) {
     return size;
   }
 
-  while (idx < size && idx < max_block_size) {
-    hash = ghash(hash, data[idx]);
-    if (!(hash & mask)) {
-      return idx;
+  if (use_64bit_gear) {
+    uint64_t hash = 0;
+  	while (idx < min_block_size) {
+  		hash = gear_common::roll(hash, static_cast<uint8_t>(data[idx]));
+  		idx += 1;
+  	}
+    while (idx < size && idx < max_block_size) {
+      hash = gear_common::roll(hash, static_cast<uint8_t>(data[idx]));
+      if (!(hash & mask)) {
+        return idx;
+      }
+      idx += 1;
     }
-    idx += 1;
+  } else {
+    uint32_t hash = 0;
+    const uint32_t mask_32 = static_cast<uint32_t>(mask >> 32);
+  	while (idx < min_block_size) {
+  		hash = gear_common::roll(hash, static_cast<uint8_t>(data[idx]));
+  		idx += 1;
+  	}
+    while (idx < size && idx < max_block_size) {
+      hash = gear_common::roll(hash, static_cast<uint8_t>(data[idx]));
+      if (!(hash & mask_32)) {
+        return idx;
+      }
+      idx += 1;
+    }
   }
 
   return idx;
 }
 
 uint64_t Gear_Chunking::find_cutpoint_avx512(char* data, uint64_t size) {
-  uint64_t hash = 0;
-  uint64_t idx = min_block_size;
-
-  // If given data is lower than the minimum chunk size, return data length.
-  if (size <= min_block_size) {
-    return size;
-  }
-
-  while (idx < size && idx < max_block_size) {
-    hash = ghash(hash, data[idx]);
-    if (!(hash & mask)) {
-      return idx;
-    }
-    idx += 1;
-  }
-
-  return idx;
+  return find_cutpoint_serial(data, size);
 }

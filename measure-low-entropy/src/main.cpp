@@ -146,7 +146,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Analyzing: " << file_path << " ..." << std::endl;
 
         std::ifstream file_ptr;
-        file_ptr.open(file_path, std::ios::in);
+        file_ptr.open(file_path, std::ios::in | std::ios::binary);
 
         // Get size of file
         file_ptr.seekg(0, std::ios_base::end);

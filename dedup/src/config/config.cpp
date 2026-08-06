@@ -217,6 +217,24 @@ uint64_t Config::get_gear_max_block_size() const {
         "size for gear hash");
 }
 
+bool Config::get_use_64bit_gear() const {
+    std::string value;
+    try {
+        value = parser.get_property(USE_64BIT_GEAR);
+    } catch (...) {
+        return false;
+    }
+
+    if (value == "true") {
+        return true;
+    }
+    if (value == "false") {
+        return false;
+    }
+    throw ConfigError(
+        "The use_64bit_gear option must be either 'true' or 'false'");
+}
+
 uint64_t Config::get_sscdc_optimization_level() const {
     std::string value{};
     try {
