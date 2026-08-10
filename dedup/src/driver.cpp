@@ -28,6 +28,7 @@
 #include "supercdc.hpp"
 #include "fixed_chunking.hpp"
 #include "gear_chunking.hpp"
+#include "prefix_sum_chunking.hpp"
 #include "cdcz_chunking.hpp"
 #include "rabins_chunking.hpp"
 #include "ram_chunking.hpp"
@@ -173,6 +174,9 @@ int main(int argc, char* argv[]) {
                 break;
             case ChunkingTech::GEAR:
                 chunk_method = std::make_unique<Gear_Chunking>(config);
+                break;
+            case ChunkingTech::PREFIX_SUM:
+                chunk_method = std::make_unique<Prefix_Sum_Chunking>(config);
                 break;
             case ChunkingTech::FASTCDC:
               chunk_method = std::make_unique<FastCDC>(config);

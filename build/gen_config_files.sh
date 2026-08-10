@@ -4,8 +4,8 @@
 AVG_SIZE=8192
 MIN_SIZE=""
 MAX_SIZE=""
-TECHNIQUES=("fixed" "rabins" "ae" "gear" "fastcdc" "ram" "crc" "experiment" "seq")
-VALID_TECHNIQUES=("fixed" "rabins" "ae" "gear" "fastcdc" "ram" "crc" "experiment" "seq")
+TECHNIQUES=("fixed" "rabins" "ae" "gear" "prefix_sum" "fastcdc" "ram" "crc" "experiment" "seq")
+VALID_TECHNIQUES=("fixed" "rabins" "ae" "gear" "prefix_sum" "fastcdc" "ram" "crc" "experiment" "seq")
 
 SILENT=false
 now=$(date +%F_%T)
@@ -126,10 +126,28 @@ for technique in "${TECHNIQUES[@]}"; do
       fi
       echo "gear_avg_block_size = $AVG_SIZE"
       echo "use_64bit_gear = false"
+      echo "gear_use_low_bit_mask = false"
       if [ ! -z "$MAX_SIZE" ]; then
         echo "gear_max_block_size = $MAX_SIZE"
       else
         echo "gear_max_block_size = $(($AVG_SIZE * 4))"
+      fi
+    elif [[ "$technique" == "prefix_sum" ]]; then
+      if [ ! -z "$MIN_SIZE" ]; then
+        echo "prefix_sum_min_block_size = $MIN_SIZE"
+      else
+        echo "prefix_sum_min_block_size = $(($AVG_SIZE / 4))"
+      fi
+      echo "prefix_sum_avg_block_size = $AVG_SIZE"
+      echo "use_64bit_prefix_sum = false"
+      echo "use_gear_table_lookup = false"
+      echo "prefix_sum_contribution_lookahead = false"
+      echo "use_subminimum_skipping = true"
+      echo "use_context_repair = true"
+      if [ ! -z "$MAX_SIZE" ]; then
+        echo "prefix_sum_max_block_size = $MAX_SIZE"
+      else
+        echo "prefix_sum_max_block_size = $(($AVG_SIZE * 4))"
       fi
     elif [[ "$technique" == "crc" ]]; then
       echo "crc_avg_block_size = $AVG_SIZE"

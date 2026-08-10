@@ -22,6 +22,16 @@
 #define GEAR_MAX_BLOCK_SIZE "gear_max_block_size"
 #define GEAR_AVG_BLOCK_SIZE "gear_avg_block_size"
 #define USE_64BIT_GEAR "use_64bit_gear"
+#define GEAR_USE_LOW_BIT_MASK "gear_use_low_bit_mask"
+#define PREFIX_SUM_MIN_BLOCK_SIZE "prefix_sum_min_block_size"
+#define PREFIX_SUM_MAX_BLOCK_SIZE "prefix_sum_max_block_size"
+#define PREFIX_SUM_AVG_BLOCK_SIZE "prefix_sum_avg_block_size"
+#define USE_64BIT_PREFIX_SUM "use_64bit_prefix_sum"
+#define USE_GEAR_TABLE_LOOKUP "use_gear_table_lookup"
+#define PREFIX_SUM_CONTRIBUTION_LOOKAHEAD "prefix_sum_contribution_lookahead"
+#define USE_SUBMINIMUM_SKIPPING "use_subminimum_skipping"
+#define USE_CONTEXT_REPAIR "use_context_repair"
+#define USE_SUPERCDC_BACKUP "use_supercdc_backup"
 #define FASTCDC_MIN_BLOCK_SIZE "fastcdc_min_block_size"
 #define FASTCDC_MAX_BLOCK_SIZE "fastcdc_max_block_size"
 #define FASTCDC_AVG_BLOCK_SIZE "fastcdc_avg_block_size"
@@ -62,6 +72,7 @@ enum class ChunkingTech {
     RABINS,
     AE,
     GEAR,
+    PREFIX_SUM,
     FASTCDC,
     SUPERCDC,
     CDCZ,
@@ -219,6 +230,17 @@ class Config {
      * @brief Select the 64-bit Gear hash. Defaults to false when omitted.
      */
     bool get_use_64bit_gear() const;
+    bool get_gear_use_low_bit_mask() const;
+
+    uint64_t get_prefix_sum_min_block_size() const;
+    uint64_t get_prefix_sum_avg_block_size() const;
+    uint64_t get_prefix_sum_max_block_size() const;
+    bool get_use_64bit_prefix_sum() const;
+    bool get_use_gear_table_lookup() const;
+    bool get_prefix_sum_contribution_lookahead(bool default_value) const;
+    bool get_use_subminimum_skipping() const;
+    bool get_use_context_repair() const;
+    bool get_use_supercdc_backup() const;
 
     uint64_t get_sscdc_optimization_level() const;
 
@@ -256,6 +278,12 @@ class Config {
      * @return fastcdc desired normalization level
      */
     uint64_t get_fastcdc_normalization_level() const;
+
+    /**
+     * @brief Get FastCDC normalization for chunkers where it is optional.
+     * Missing normalization settings disable normalization.
+     */
+    uint64_t get_optional_fastcdc_normalization_level() const;
 
     /**
      * @brief turns normalization off if true

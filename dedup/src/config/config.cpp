@@ -19,6 +19,8 @@ ChunkingTech Config::get_chunking_tech() const {
             return ChunkingTech::AE;
         } else if (value == "gear") {
             return ChunkingTech::GEAR;
+        } else if (value == "prefix_sum") {
+            return ChunkingTech::PREFIX_SUM;
         } else if (value == "fastcdc") {
             return ChunkingTech::FASTCDC;
         } else if (value == "supercdc") {
@@ -235,6 +237,119 @@ bool Config::get_use_64bit_gear() const {
         "The use_64bit_gear option must be either 'true' or 'false'");
 }
 
+bool Config::get_gear_use_low_bit_mask() const {
+    std::string value;
+    try {
+        value = parser.get_property(GEAR_USE_LOW_BIT_MASK);
+    } catch (...) {
+        return false;
+    }
+    if (value == "true") {
+        return true;
+    }
+    if (value == "false") {
+        return false;
+    }
+    throw ConfigError(
+        "The gear_use_low_bit_mask option must be either 'true' or 'false'");
+}
+
+uint64_t Config::get_prefix_sum_min_block_size() const {
+    try {
+        return std::stoull(parser.get_property(PREFIX_SUM_MIN_BLOCK_SIZE));
+    } catch (...) {
+    }
+    throw ConfigError(
+        "The configuration file does not specify a valid prefix-sum minimum block size");
+}
+
+uint64_t Config::get_prefix_sum_avg_block_size() const {
+    try {
+        return std::stoull(parser.get_property(PREFIX_SUM_AVG_BLOCK_SIZE));
+    } catch (...) {
+    }
+    throw ConfigError(
+        "The configuration file does not specify a valid prefix-sum average block size");
+}
+
+uint64_t Config::get_prefix_sum_max_block_size() const {
+    try {
+        return std::stoull(parser.get_property(PREFIX_SUM_MAX_BLOCK_SIZE));
+    } catch (...) {
+    }
+    throw ConfigError(
+        "The configuration file does not specify a valid prefix-sum maximum block size");
+}
+
+bool Config::get_use_64bit_prefix_sum() const {
+    std::string value;
+    try {
+        value = parser.get_property(USE_64BIT_PREFIX_SUM);
+    } catch (...) {
+        return false;
+    }
+    if (value == "true") {
+        return true;
+    }
+    if (value == "false") {
+        return false;
+    }
+    throw ConfigError(
+        "The use_64bit_prefix_sum option must be either 'true' or 'false'");
+}
+
+bool Config::get_use_gear_table_lookup() const {
+    std::string value;
+    try {
+        value = parser.get_property(USE_GEAR_TABLE_LOOKUP);
+    } catch (...) {
+        return false;
+    }
+    if (value == "true") {
+        return true;
+    }
+    if (value == "false") {
+        return false;
+    }
+    throw ConfigError(
+        "The use_gear_table_lookup option must be either 'true' or 'false'");
+}
+
+static bool get_optional_bool(const Parser& parser, const char* property,
+                              bool default_value) {
+    std::string value;
+    try {
+        value = parser.get_property(property);
+    } catch (...) {
+        return default_value;
+    }
+    if (value == "true") {
+        return true;
+    }
+    if (value == "false") {
+        return false;
+    }
+    throw ConfigError(std::string("The ") + property
+                      + " option must be either 'true' or 'false'");
+}
+
+bool Config::get_prefix_sum_contribution_lookahead(bool default_value) const {
+    return get_optional_bool(
+        parser, PREFIX_SUM_CONTRIBUTION_LOOKAHEAD, default_value);
+}
+
+bool Config::get_use_subminimum_skipping() const {
+    return get_optional_bool(parser, USE_SUBMINIMUM_SKIPPING, true);
+}
+
+bool Config::get_use_context_repair() const {
+    return get_optional_bool(parser, USE_CONTEXT_REPAIR, true);
+}
+
+bool Config::get_use_supercdc_backup() const {
+    return get_optional_bool(parser, USE_SUPERCDC_BACKUP, false);
+}
+
 uint64_t Config::get_sscdc_optimization_level() const {
     std::string value{};
     try {
@@ -304,6 +419,29 @@ uint64_t Config::get_fastcdc_normalization_level() const {
     throw ConfigError(
         "The configuration file does not specify a valid fastcdc normaliztion "
         "level");
+}
+
+uint64_t Config::get_optional_fastcdc_normalization_level() const {
+    std::string disabled;
+    try {
+        disabled = parser.get_property(FASTCDC_DISABLE_NORMALIZATION);
+    } catch (...) {
+        return 0;
+    }
+    if (disabled == "true") {
+        return 0;
+    }
+    if (disabled != "false") {
+        throw ConfigError(
+            "The fastcdc disable normalization option must be either 'true' "
+            "or 'false'");
+    }
+    const uint64_t level = get_fastcdc_normalization_level();
+    if (level < 1 || level > 3) {
+        throw ConfigError(
+            "The fastcdc normalization level must be between 1 and 3");
+    }
+    return level;
 }
 
 bool Config::get_fastcdc_disable_normalization() const {

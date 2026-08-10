@@ -22,6 +22,7 @@ class Gear_Chunking : public virtual Chunking_Technique {
     uint64_t mask;
     SIMD_Mode simd_mode;
     bool use_64bit_gear;
+    bool use_low_bit_mask;
 
     // for ss-cdc
     uint64_t file_size;
