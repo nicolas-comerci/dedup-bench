@@ -21,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -55,9 +56,6 @@ Gear_Chunking::Gear_Chunking(const Config& config) {
 	simd_mode = config.get_simd_mode();
 	use_64bit_gear = config.get_use_64bit_gear();
 	use_low_bit_mask = config.get_gear_use_low_bit_mask();
-	if (simd_mode != SIMD_Mode::NONE && use_64bit_gear) {
-		throw ConfigError("64-bit Gear is unsupported for SSCDC");
-	}
 	if (simd_mode != SIMD_Mode::NONE && use_low_bit_mask) {
 		throw ConfigError(
 			"Low-bit Gear masks are always enabled on SIMD modes");
@@ -811,6 +809,218 @@ static void sscdc_chunking_phase_one_avx2_gear_with_load_transpose(uint32_t mask
 		file_data_offset++;
 	}
 }
+
+enum class SSCDC64Avx2InputMode {
+	IMMEDIATE_GATHER,
+	SCHEDULED_GATHER,
+	LOAD_TRANSPOSE,
+};
+
+static inline void gather_gear64_entries_avx2(
+		__m128i cbytes,
+		__m128i byte_mask,
+		__m256i (&tentries)[4]) {
+	const __m128i idx0 = _mm_and_si128(cbytes, byte_mask);
+	const __m128i idx1 = _mm_and_si128(_mm_srli_epi32(cbytes, 8), byte_mask);
+	const __m128i idx2 = _mm_and_si128(_mm_srli_epi32(cbytes, 16), byte_mask);
+	const __m128i idx3 = _mm_srli_epi32(cbytes, 24);
+	const auto* table = reinterpret_cast<const long long*>(gear_common::table_64);
+	tentries[0] = _mm256_i32gather_epi64(table, idx0, 8);
+	tentries[1] = _mm256_i32gather_epi64(table, idx1, 8);
+	tentries[2] = _mm256_i32gather_epi64(table, idx2, 8);
+	tentries[3] = _mm256_i32gather_epi64(table, idx3, 8);
+}
+
+static inline void load_and_transpose_4x8_epi32_avx2(
+		const unsigned char* RESTRICT file_data,
+		uint64_t bytes_per_lane,
+		__m128i (&columns)[8]) {
+	__m256i rows[4];
+	for (uint32_t lane_i = 0; lane_i < 4; lane_i++) {
+		rows[lane_i] = _mm256_loadu_si256(
+			reinterpret_cast<const __m256i*>(file_data + lane_i * bytes_per_lane)
+		);
+	}
+
+	__m128 low0 = _mm_castsi128_ps(_mm256_castsi256_si128(rows[0]));
+	__m128 low1 = _mm_castsi128_ps(_mm256_castsi256_si128(rows[1]));
+	__m128 low2 = _mm_castsi128_ps(_mm256_castsi256_si128(rows[2]));
+	__m128 low3 = _mm_castsi128_ps(_mm256_castsi256_si128(rows[3]));
+	_MM_TRANSPOSE4_PS(low0, low1, low2, low3);
+	columns[0] = _mm_castps_si128(low0);
+	columns[1] = _mm_castps_si128(low1);
+	columns[2] = _mm_castps_si128(low2);
+	columns[3] = _mm_castps_si128(low3);
+
+	__m128 high0 = _mm_castsi128_ps(_mm256_extracti128_si256(rows[0], 1));
+	__m128 high1 = _mm_castsi128_ps(_mm256_extracti128_si256(rows[1], 1));
+	__m128 high2 = _mm_castsi128_ps(_mm256_extracti128_si256(rows[2], 1));
+	__m128 high3 = _mm_castsi128_ps(_mm256_extracti128_si256(rows[3], 1));
+	_MM_TRANSPOSE4_PS(high0, high1, high2, high3);
+	columns[4] = _mm_castps_si128(high0);
+	columns[5] = _mm_castps_si128(high1);
+	columns[6] = _mm_castps_si128(high2);
+	columns[7] = _mm_castps_si128(high3);
+}
+
+static inline void record_cutpoints64_avx2(
+		__m256i hash,
+		__m256i break_mark,
+		__m256i high_bitmap_bit,
+		__m256i& bitmap_words) {
+	const __m256i candidates = _mm256_cmpeq_epi64(
+		_mm256_and_si256(hash, break_mark),
+		_mm256_setzero_si256()
+	);
+	bitmap_words = _mm256_srli_epi64(bitmap_words, 1);
+	bitmap_words = _mm256_or_si256(
+		bitmap_words,
+		_mm256_and_si256(candidates, high_bitmap_bit)
+	);
+}
+
+static inline void store_cutpoint_words64_avx2(
+		__m256i bitmap_words,
+		uint64_t bitmap_batch_offset,
+		uint64_t bitmap_bytes_per_lane,
+		uint8_t* RESTRICT cutpoint_bitmap) {
+	if (_mm256_testz_si256(bitmap_words, bitmap_words)) {
+		return;
+	}
+	alignas(32) uint64_t words[4];
+	_mm256_store_si256(reinterpret_cast<__m256i*>(words), bitmap_words);
+	for (uint32_t lane_i = 0; lane_i < 4; lane_i++) {
+		if (words[lane_i] != 0) {
+			const uint64_t bitmap_offset = bitmap_batch_offset + lane_i * bitmap_bytes_per_lane;
+			const uint32_t word = static_cast<uint32_t>(words[lane_i]);
+			std::memcpy(cutpoint_bitmap + bitmap_offset, &word, sizeof(word));
+		}
+	}
+}
+
+template <SSCDC64Avx2InputMode InputMode>
+static void sscdc_chunking_phase_one_avx2_gear64(
+		uint64_t mask,
+		uint64_t min_block_size,
+		const unsigned char* RESTRICT file_data,
+		uint64_t file_size,
+		uint8_t* RESTRICT cutpoint_bitmap) {
+	static constexpr uint32_t LANE_COUNT = 4;
+	static constexpr uint64_t HASH_LENGTH = 64;
+	static constexpr uint32_t DWORDS_PER_BITMAP_WORD = 8;
+	const __m256i break_mark = _mm256_set1_epi64x(static_cast<long long>(mask));
+	const __m128i byte_mask = _mm_set1_epi32(0xff);
+	const __m256i high_bitmap_bit = _mm256_set1_epi64x(1ull << 31);
+	uint64_t file_data_offset = 0;
+	uint64_t total_bytes_left = file_size;
+
+	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * HASH_LENGTH, min_block_size)) {
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
+		const uint64_t bytes_per_lane_without_overlap =
+			(((window_bytes - HASH_LENGTH) / LANE_COUNT) / HASH_LENGTH) * HASH_LENGTH;
+		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + HASH_LENGTH;
+		window_bytes = bytes_per_lane_without_overlap * LANE_COUNT + HASH_LENGTH;
+
+		const __m128i lane_index = _mm_mullo_epi32(
+			_mm_setr_epi32(0, 1, 2, 3),
+			_mm_set1_epi32(static_cast<int32_t>(bytes_per_lane_without_overlap))
+		);
+		__m256i hash = _mm256_setzero_si256();
+
+		auto load_cbytes = [&](uint64_t batch_offset, __m128i (&cbytes)[DWORDS_PER_BITMAP_WORD]) {
+			if constexpr (InputMode == SSCDC64Avx2InputMode::LOAD_TRANSPOSE) {
+				load_and_transpose_4x8_epi32_avx2(
+					file_data + file_data_offset + batch_offset,
+					bytes_per_lane_without_overlap,
+					cbytes
+				);
+			} else {
+				for (uint32_t i = 0; i < DWORDS_PER_BITMAP_WORD; i++) {
+					cbytes[i] = _mm_i32gather_epi32(
+						reinterpret_cast<const int*>(file_data + file_data_offset + batch_offset + i * sizeof(int32_t)),
+						lane_index,
+						1
+					);
+				}
+			}
+		};
+
+		auto process_batch = [&](uint64_t batch_offset, auto record_tag) {
+			constexpr bool RECORD_CUTPOINTS = decltype(record_tag)::value;
+			__m128i cbytes[DWORDS_PER_BITMAP_WORD]{};
+			load_cbytes(batch_offset, cbytes);
+			__m256i bitmap_words = _mm256_setzero_si256();
+
+			if constexpr (InputMode == SSCDC64Avx2InputMode::IMMEDIATE_GATHER) {
+				for (uint32_t i = 0; i < DWORDS_PER_BITMAP_WORD; i++) {
+					__m128i remaining = cbytes[i];
+					for (uint32_t byte_i = 0; byte_i < sizeof(int32_t); byte_i++) {
+						const __m128i index = _mm_and_si128(remaining, byte_mask);
+						const __m256i entry = _mm256_i32gather_epi64(
+							reinterpret_cast<const long long*>(gear_common::table_64), index, 8
+						);
+						hash = _mm256_add_epi64(_mm256_slli_epi64(hash, 1), entry);
+						if constexpr (RECORD_CUTPOINTS) {
+							record_cutpoints64_avx2(hash, break_mark, high_bitmap_bit, bitmap_words);
+						}
+						remaining = _mm_srli_epi32(remaining, 8);
+					}
+				}
+			} else {
+				__m256i entries[DWORDS_PER_BITMAP_WORD][4];
+				__m256i hashes[DWORDS_PER_BITMAP_WORD][4];
+				for (uint32_t i = 0; i < DWORDS_PER_BITMAP_WORD; i++) {
+					gather_gear64_entries_avx2(cbytes[i], byte_mask, entries[i]);
+				}
+				for (uint32_t i = 0; i < DWORDS_PER_BITMAP_WORD; i++) {
+					for (uint32_t byte_i = 0; byte_i < 4; byte_i++) {
+						hash = _mm256_add_epi64(_mm256_slli_epi64(hash, 1), entries[i][byte_i]);
+						hashes[i][byte_i] = hash;
+					}
+				}
+				if constexpr (RECORD_CUTPOINTS) {
+					for (uint32_t i = 0; i < DWORDS_PER_BITMAP_WORD; i++) {
+						for (uint32_t byte_i = 0; byte_i < 4; byte_i++) {
+							record_cutpoints64_avx2(hashes[i][byte_i], break_mark, high_bitmap_bit, bitmap_words);
+						}
+					}
+				}
+			}
+
+			if constexpr (RECORD_CUTPOINTS) {
+				store_cutpoint_words64_avx2(
+					bitmap_words,
+					(file_data_offset + batch_offset) >> 3,
+					bytes_per_lane_without_overlap >> 3,
+					cutpoint_bitmap
+				);
+			}
+		};
+
+		process_batch(0, std::false_type{});
+		process_batch(32, std::false_type{});
+		for (uint64_t batch_offset = HASH_LENGTH; batch_offset < bytes_per_lane; batch_offset += 32) {
+			process_batch(batch_offset, std::true_type{});
+		}
+
+		file_data_offset += window_bytes - HASH_LENGTH;
+		total_bytes_left -= window_bytes - HASH_LENGTH;
+	}
+
+	file_data_offset = file_data_offset >= HASH_LENGTH ? file_data_offset - HASH_LENGTH : 0;
+	uint64_t pattern = 0;
+	for (uint32_t j = 0; j < HASH_LENGTH && file_data_offset < file_size; j++) {
+		pattern = gear_common::roll(pattern, file_data[file_data_offset++]);
+	}
+	while (file_data_offset < file_size) {
+		pattern = gear_common::roll(pattern, file_data[file_data_offset]);
+		if (!(pattern & mask)) {
+			cutpoint_bitmap[file_data_offset >> 3] |=
+				static_cast<uint8_t>(1u << (file_data_offset & 7));
+		}
+		file_data_offset++;
+	}
+}
 #undef doGearAvx2
 #endif
 
@@ -1003,6 +1213,219 @@ static void sscdc_chunking_phase_one_avx512_gear_with_load_transpose(uint32_t ma
 			const uint32_t byte_pos = file_data_offset / 8u;
 			const uint8_t bit_pos = file_data_offset % 8u;
 			cutpoint_bitmap[byte_pos] = cutpoint_bitmap[byte_pos] | static_cast<uint8_t>(1u << bit_pos);
+		}
+		file_data_offset++;
+	}
+}
+
+enum class SSCDC64Avx512InputMode {
+	IMMEDIATE_GATHER,
+	SCHEDULED_GATHER,
+	LOAD_TRANSPOSE,
+};
+
+static inline void load_and_transpose_8x4_epi64_avx512(
+		const unsigned char* RESTRICT file_data,
+		uint64_t bytes_per_lane,
+		__m512i (&columns)[4]) {
+	constexpr __mmask8 LOW_FOUR_QWORDS = 0x0f;
+	__m512i rows[8];
+	for (uint32_t lane_i = 0; lane_i < 8; lane_i++) {
+		rows[lane_i] = _mm512_maskz_loadu_epi64(
+			LOW_FOUR_QWORDS,
+			file_data + lane_i * bytes_per_lane
+		);
+	}
+
+	const __m512i pair_indices = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+	const __m512i group4_low_indices = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+	const __m512i group4_high_indices = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+	const __m512i column_low_indices = _mm512_setr_epi64(0, 1, 2, 3, 8, 9, 10, 11);
+	const __m512i column_high_indices = _mm512_setr_epi64(4, 5, 6, 7, 12, 13, 14, 15);
+
+	__m512i row_pairs[4];
+	for (uint32_t pair_i = 0; pair_i < 4; pair_i++) {
+		row_pairs[pair_i] = _mm512_permutex2var_epi64(
+			rows[2 * pair_i], pair_indices, rows[2 * pair_i + 1]
+		);
+	}
+	__m512i row_groups4[4];
+	for (uint32_t group_i = 0; group_i < 2; group_i++) {
+		row_groups4[2 * group_i] = _mm512_permutex2var_epi64(
+			row_pairs[2 * group_i], group4_low_indices, row_pairs[2 * group_i + 1]
+		);
+		row_groups4[2 * group_i + 1] = _mm512_permutex2var_epi64(
+			row_pairs[2 * group_i], group4_high_indices, row_pairs[2 * group_i + 1]
+		);
+	}
+	columns[0] = _mm512_permutex2var_epi64(row_groups4[0], column_low_indices, row_groups4[2]);
+	columns[1] = _mm512_permutex2var_epi64(row_groups4[0], column_high_indices, row_groups4[2]);
+	columns[2] = _mm512_permutex2var_epi64(row_groups4[1], column_low_indices, row_groups4[3]);
+	columns[3] = _mm512_permutex2var_epi64(row_groups4[1], column_high_indices, row_groups4[3]);
+}
+
+static inline void gather_gear64_entries_avx512(
+		__m512i cbytes,
+		__m512i byte_mask,
+		__m512i (&tentries)[8]) {
+	for (uint32_t byte_i = 0; byte_i < 8; byte_i++) {
+		const __m512i index = _mm512_and_epi64(cbytes, byte_mask);
+		tentries[byte_i] = _mm512_i64gather_epi64(index, gear_common::table_64, 8);
+		cbytes = _mm512_srli_epi64(cbytes, 8);
+	}
+}
+
+static inline void record_cutpoints64_avx512(
+		__m512i hash,
+		__m512i break_mark,
+		__m512i high_bitmap_bit,
+		__m512i& bitmap_words) {
+	const __mmask8 candidate_lanes = _mm512_testn_epi64_mask(hash, break_mark);
+	bitmap_words = _mm512_srli_epi64(bitmap_words, 1);
+	bitmap_words = _mm512_or_si512(
+		bitmap_words,
+		_mm512_maskz_mov_epi64(candidate_lanes, high_bitmap_bit)
+	);
+}
+
+static inline void store_cutpoint_words64_avx512(
+		__m512i bitmap_words,
+		uint64_t bitmap_batch_offset,
+		uint64_t bitmap_bytes_per_lane,
+		uint8_t* RESTRICT cutpoint_bitmap) {
+	const __mmask8 lanes_with_results = _mm512_cmpneq_epi64_mask(
+		bitmap_words, _mm512_setzero_si512()
+	);
+	if (lanes_with_results == 0) {
+		return;
+	}
+	alignas(64) uint64_t words[8];
+	_mm512_store_si512(words, bitmap_words);
+	for (uint32_t lane_i = 0; lane_i < 8; lane_i++) {
+		if ((lanes_with_results & (1u << lane_i)) != 0) {
+			const uint64_t bitmap_offset = bitmap_batch_offset + lane_i * bitmap_bytes_per_lane;
+			const uint32_t word = static_cast<uint32_t>(words[lane_i]);
+			std::memcpy(cutpoint_bitmap + bitmap_offset, &word, sizeof(word));
+		}
+	}
+}
+
+template <SSCDC64Avx512InputMode InputMode>
+static void sscdc_chunking_phase_one_avx512_gear64(
+		uint64_t mask,
+		uint64_t min_block_size,
+		const unsigned char* RESTRICT file_data,
+		uint64_t file_size,
+		uint8_t* RESTRICT cutpoint_bitmap) {
+	static constexpr uint32_t LANE_COUNT = 8;
+	static constexpr uint64_t HASH_LENGTH = 64;
+	static constexpr uint32_t QWORDS_PER_BITMAP_WORD = 4;
+	const __m512i break_mark = _mm512_set1_epi64(static_cast<long long>(mask));
+	const __m512i byte_mask = _mm512_set1_epi64(0xff);
+	const __m512i high_bitmap_bit = _mm512_set1_epi64(1ull << 31);
+	uint64_t file_data_offset = 0;
+	uint64_t total_bytes_left = file_size;
+
+	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * HASH_LENGTH, min_block_size)) {
+		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
+		const uint64_t bytes_per_lane_without_overlap =
+			(((window_bytes - HASH_LENGTH) / LANE_COUNT) / HASH_LENGTH) * HASH_LENGTH;
+		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + HASH_LENGTH;
+		window_bytes = bytes_per_lane_without_overlap * LANE_COUNT + HASH_LENGTH;
+		const auto stride = static_cast<long long>(bytes_per_lane_without_overlap);
+		const __m512i lane_index = _mm512_setr_epi64(
+			0, stride, 2 * stride, 3 * stride, 4 * stride, 5 * stride, 6 * stride, 7 * stride
+		);
+		__m512i hash = _mm512_setzero_si512();
+
+		auto load_cbytes = [&](uint64_t batch_offset, __m512i (&cbytes)[QWORDS_PER_BITMAP_WORD]) {
+			if constexpr (InputMode == SSCDC64Avx512InputMode::LOAD_TRANSPOSE) {
+				load_and_transpose_8x4_epi64_avx512(
+					file_data + file_data_offset + batch_offset,
+					bytes_per_lane_without_overlap,
+					cbytes
+				);
+			} else {
+				for (uint32_t i = 0; i < QWORDS_PER_BITMAP_WORD; i++) {
+					cbytes[i] = _mm512_i64gather_epi64(
+						lane_index,
+						file_data + file_data_offset + batch_offset + i * sizeof(int64_t),
+						1
+					);
+				}
+			}
+		};
+
+		auto process_batch = [&](uint64_t batch_offset, auto record_tag) {
+			constexpr bool RECORD_CUTPOINTS = decltype(record_tag)::value;
+			__m512i cbytes[QWORDS_PER_BITMAP_WORD]{};
+			load_cbytes(batch_offset, cbytes);
+			__m512i bitmap_words = _mm512_setzero_si512();
+
+			if constexpr (InputMode == SSCDC64Avx512InputMode::IMMEDIATE_GATHER) {
+				for (uint32_t i = 0; i < QWORDS_PER_BITMAP_WORD; i++) {
+					__m512i remaining = cbytes[i];
+					for (uint32_t byte_i = 0; byte_i < sizeof(int64_t); byte_i++) {
+						const __m512i index = _mm512_and_epi64(remaining, byte_mask);
+						const __m512i entry = _mm512_i64gather_epi64(index, gear_common::table_64, 8);
+						hash = _mm512_add_epi64(_mm512_slli_epi64(hash, 1), entry);
+						if constexpr (RECORD_CUTPOINTS) {
+							record_cutpoints64_avx512(hash, break_mark, high_bitmap_bit, bitmap_words);
+						}
+						remaining = _mm512_srli_epi64(remaining, 8);
+					}
+				}
+			} else {
+				__m512i entries[QWORDS_PER_BITMAP_WORD][8];
+				__m512i hashes[QWORDS_PER_BITMAP_WORD][8];
+				for (uint32_t i = 0; i < QWORDS_PER_BITMAP_WORD; i++) {
+					gather_gear64_entries_avx512(cbytes[i], byte_mask, entries[i]);
+				}
+				for (uint32_t i = 0; i < QWORDS_PER_BITMAP_WORD; i++) {
+					for (uint32_t byte_i = 0; byte_i < 8; byte_i++) {
+						hash = _mm512_add_epi64(_mm512_slli_epi64(hash, 1), entries[i][byte_i]);
+						hashes[i][byte_i] = hash;
+					}
+				}
+				if constexpr (RECORD_CUTPOINTS) {
+					for (uint32_t i = 0; i < QWORDS_PER_BITMAP_WORD; i++) {
+						for (uint32_t byte_i = 0; byte_i < 8; byte_i++) {
+							record_cutpoints64_avx512(hashes[i][byte_i], break_mark, high_bitmap_bit, bitmap_words);
+						}
+					}
+				}
+			}
+
+			if constexpr (RECORD_CUTPOINTS) {
+				store_cutpoint_words64_avx512(
+					bitmap_words,
+					(file_data_offset + batch_offset) >> 3,
+					bytes_per_lane_without_overlap >> 3,
+					cutpoint_bitmap
+				);
+			}
+		};
+
+		process_batch(0, std::false_type{});
+		process_batch(32, std::false_type{});
+		for (uint64_t batch_offset = HASH_LENGTH; batch_offset < bytes_per_lane; batch_offset += 32) {
+			process_batch(batch_offset, std::true_type{});
+		}
+
+		file_data_offset += window_bytes - HASH_LENGTH;
+		total_bytes_left -= window_bytes - HASH_LENGTH;
+	}
+
+	file_data_offset = file_data_offset >= HASH_LENGTH ? file_data_offset - HASH_LENGTH : 0;
+	uint64_t pattern = 0;
+	for (uint32_t j = 0; j < HASH_LENGTH && file_data_offset < file_size; j++) {
+		pattern = gear_common::roll(pattern, file_data[file_data_offset++]);
+	}
+	while (file_data_offset < file_size) {
+		pattern = gear_common::roll(pattern, file_data[file_data_offset]);
+		if (!(pattern & mask)) {
+			cutpoint_bitmap[file_data_offset >> 3] |=
+				static_cast<uint8_t>(1u << (file_data_offset & 7));
 		}
 		file_data_offset++;
 	}
@@ -1223,20 +1646,25 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 		return Chunking_Technique::chunk_file(file_path);
 	}
 
-	using phase_one_function = void (*)(uint32_t, uint64_t, const unsigned char*, uint64_t, uint8_t*);
-	phase_one_function phase_one = nullptr;
+	using phase_one_function32 = void (*)(uint32_t, uint64_t, const unsigned char*, uint64_t, uint8_t*);
+	using phase_one_function64 = void (*)(uint64_t, uint64_t, const unsigned char*, uint64_t, uint8_t*);
+	phase_one_function32 phase_one32 = nullptr;
+	phase_one_function64 phase_one64 = nullptr;
 	switch (simd_mode) {
 	#if defined(__AVX2__)
 		case SIMD_Mode::AVX256: {
 			switch (optimization_level) {
 				case 1:
-					phase_one = sscdc_chunking_phase_one_avx2_gear_with_gather_scheduling;
+					phase_one32 = sscdc_chunking_phase_one_avx2_gear_with_gather_scheduling;
+					phase_one64 = sscdc_chunking_phase_one_avx2_gear64<SSCDC64Avx2InputMode::SCHEDULED_GATHER>;
 					break;
 				case 2:
-					phase_one = sscdc_chunking_phase_one_avx2_gear_with_load_transpose;
+					phase_one32 = sscdc_chunking_phase_one_avx2_gear_with_load_transpose;
+					phase_one64 = sscdc_chunking_phase_one_avx2_gear64<SSCDC64Avx2InputMode::LOAD_TRANSPOSE>;
 					break;
 				default:
-					phase_one = sscdc_chunking_phase_one_avx2_gear;
+					phase_one32 = sscdc_chunking_phase_one_avx2_gear;
+					phase_one64 = sscdc_chunking_phase_one_avx2_gear64<SSCDC64Avx2InputMode::IMMEDIATE_GATHER>;
 					break;
 			}
 			break;
@@ -1246,13 +1674,16 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 		case SIMD_Mode::AVX512: {
 			switch (optimization_level) {
 				case 1:
-					phase_one = sscdc_chunking_phase_one_avx512_gear_with_gather_scheduling;
+					phase_one32 = sscdc_chunking_phase_one_avx512_gear_with_gather_scheduling;
+					phase_one64 = sscdc_chunking_phase_one_avx512_gear64<SSCDC64Avx512InputMode::SCHEDULED_GATHER>;
 					break;
 				case 2:
-					phase_one = sscdc_chunking_phase_one_avx512_gear_with_load_transpose;
+					phase_one32 = sscdc_chunking_phase_one_avx512_gear_with_load_transpose;
+					phase_one64 = sscdc_chunking_phase_one_avx512_gear64<SSCDC64Avx512InputMode::LOAD_TRANSPOSE>;
 					break;
 				default:
-					phase_one = sscdc_chunking_phase_one_avx512_gear;
+					phase_one32 = sscdc_chunking_phase_one_avx512_gear;
+					phase_one64 = sscdc_chunking_phase_one_avx512_gear64<SSCDC64Avx512InputMode::IMMEDIATE_GATHER>;
 					break;
 			}
 			break;
@@ -1306,9 +1737,14 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 	}
 
 	auto begin_chunking = std::chrono::high_resolution_clock::now();
-	// mask was made for 64bits on the most significant bits, shift and cast to 32bit
-	uint32_t avg_mask = static_cast<uint32_t>(mask >> 32);
-	phase_one(avg_mask, min_block_size, file_data, file_size, cutpoint_bitmap);
+	// The configured mask is stored as a 64-bit high-bit mask. The 32-bit
+	// implementation uses its upper half; 64-bit Gear consumes it directly.
+	const uint32_t avg_mask32 = static_cast<uint32_t>(mask >> 32);
+	if (use_64bit_gear) {
+		phase_one64(mask, min_block_size, file_data, file_size, cutpoint_bitmap);
+	} else {
+		phase_one32(avg_mask32, min_block_size, file_data, file_size, cutpoint_bitmap);
+	}
 	auto end_chunking = std::chrono::high_resolution_clock::now();
 	total_time_chunking += (end_chunking - begin_chunking);
 
@@ -1319,14 +1755,27 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 #ifndef NDEBUG
 		// DEBUG: serially check next chunk size, crash if there is a mismatch
 		auto debug_curr_pos = prev_cut_offset;
-		uint32_t hash = 0;
-		for (; debug_curr_pos < file_size; debug_curr_pos++) {
-			hash = (hash << 1) + gear_common::table_32[file_data[debug_curr_pos]];
-			if (!(hash & avg_mask) && (debug_curr_pos - prev_cut_offset >= min_block_size)) {
-				break;
+		if (use_64bit_gear) {
+			uint64_t hash = 0;
+			for (; debug_curr_pos < file_size; debug_curr_pos++) {
+				hash = gear_common::roll(hash, file_data[debug_curr_pos]);
+				if (!(hash & mask) && (debug_curr_pos - prev_cut_offset >= min_block_size)) {
+					break;
+				}
+				if ((debug_curr_pos - prev_cut_offset == max_block_size)) {
+					break;
+				}
 			}
-			if ((debug_curr_pos - prev_cut_offset == max_block_size)) {
-				break;
+		} else {
+			uint32_t hash = 0;
+			for (; debug_curr_pos < file_size; debug_curr_pos++) {
+				hash = gear_common::roll(hash, file_data[debug_curr_pos]);
+				if (!(hash & avg_mask32) && (debug_curr_pos - prev_cut_offset >= min_block_size)) {
+					break;
+				}
+				if ((debug_curr_pos - prev_cut_offset == max_block_size)) {
+					break;
+				}
 			}
 		}
 		uint64_t debug_chunk_size = debug_curr_pos - prev_cut_offset;
