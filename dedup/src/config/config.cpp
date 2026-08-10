@@ -235,6 +235,23 @@ bool Config::get_use_64bit_gear() const {
         "The use_64bit_gear option must be either 'true' or 'false'");
 }
 
+bool Config::get_gear_use_low_bit_mask() const {
+    std::string value;
+    try {
+        value = parser.get_property(GEAR_USE_LOW_BIT_MASK);
+    } catch (...) {
+        return false;
+    }
+    if (value == "true") {
+        return true;
+    }
+    if (value == "false") {
+        return false;
+    }
+    throw ConfigError(
+        "The gear_use_low_bit_mask option must be either 'true' or 'false'");
+}
+
 uint64_t Config::get_sscdc_optimization_level() const {
     std::string value{};
     try {
@@ -315,6 +332,24 @@ bool Config::get_fastcdc_disable_normalization() const {
     throw ConfigError(
         "The configuration file does not specify a valid fastcdc disable "
         "normalization option");
+}
+
+static bool get_optional_bool(const Parser& parser, const char* property,
+                              bool default_value) {
+    std::string value;
+    try {
+        value = parser.get_property(property);
+    } catch (...) {
+        return default_value;
+    }
+    if (value == "true") {
+        return true;
+    }
+    if (value == "false") {
+        return false;
+    }
+    throw ConfigError(std::string("The ") + property
+                      + " option must be either 'true' or 'false'");
 }
 
 uint64_t Config::get_ram_avg_block_size() const {

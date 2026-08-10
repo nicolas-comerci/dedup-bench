@@ -22,6 +22,7 @@
 #define GEAR_MAX_BLOCK_SIZE "gear_max_block_size"
 #define GEAR_AVG_BLOCK_SIZE "gear_avg_block_size"
 #define USE_64BIT_GEAR "use_64bit_gear"
+#define GEAR_USE_LOW_BIT_MASK "gear_use_low_bit_mask"
 #define FASTCDC_MIN_BLOCK_SIZE "fastcdc_min_block_size"
 #define FASTCDC_MAX_BLOCK_SIZE "fastcdc_max_block_size"
 #define FASTCDC_AVG_BLOCK_SIZE "fastcdc_avg_block_size"
@@ -219,6 +220,7 @@ class Config {
      * @brief Select the 64-bit Gear hash. Defaults to false when omitted.
      */
     bool get_use_64bit_gear() const;
+    bool get_gear_use_low_bit_mask() const;
 
     uint64_t get_sscdc_optimization_level() const;
 

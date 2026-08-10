@@ -13,14 +13,35 @@
 
 #include <cmath>
 #include <cstring>
-#include <filesystem>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 
 extern bool disable_hashing;
+
+namespace {
+
+constexpr std::size_t stream_buffer_alignment = 64;
+
+struct aligned_buffer_deleter {
+    void operator()(char* buffer) const noexcept {
+        ::operator delete[](
+            buffer, std::align_val_t{stream_buffer_alignment});
+    }
+};
+
+using aligned_buffer = std::unique_ptr<char[], aligned_buffer_deleter>;
+
+aligned_buffer allocate_stream_buffer(std::size_t size) {
+    return aligned_buffer(static_cast<char*>(::operator new[](
+        size, std::align_val_t{stream_buffer_alignment})));
+}
+
+}  // namespace
 
 File_Chunk::File_Chunk(uint64_t _chunk_size) {
     chunk_size = _chunk_size;
@@ -170,7 +191,6 @@ int64_t Chunking_Technique::create_chunk(std::vector<std::string>& hashes,
 
 void Chunking_Technique::chunk_stream(std::vector<std::string>& hashes,
                                       std::istream& stream) {
-    std::vector<char> buffer;
     int64_t buffer_size;
     if(this->stream_buffer_size == 0){
         buffer_size = 1024 * 1024; // 1 Mib
@@ -178,7 +198,12 @@ void Chunking_Technique::chunk_stream(std::vector<std::string>& hashes,
         buffer_size = this->stream_buffer_size;
     }
     int64_t bytes_left = get_file_size(&stream);
-    buffer.resize(buffer_size);
+    aligned_buffer buffer = allocate_stream_buffer(
+        static_cast<std::size_t>(buffer_size));
+    if (reinterpret_cast<std::uintptr_t>(buffer.get())
+            % stream_buffer_alignment != 0) {
+        throw std::runtime_error("Stream buffer is not 64-byte aligned");
+    }
     // initial chunk_size to allow the read of full buffer size
     int64_t chunk_size = buffer_size;
     // logical buffer end
@@ -187,22 +212,22 @@ void Chunking_Technique::chunk_stream(std::vector<std::string>& hashes,
     while (true) {
         uint32_t bytes_to_read =
             std::min((int64_t)(buffer_size), std::min(bytes_left, chunk_size));
-        stream.read(buffer.data() + buffer_end, bytes_to_read);
+        stream.read(buffer.get() + buffer_end, bytes_to_read);
         if (stream.gcount() == 0) {
             break;
         }
 
         buffer_end += bytes_to_read;
-        chunk_size = create_chunk(hashes, buffer.data(), buffer_end);
+        chunk_size = create_chunk(hashes, buffer.get(), buffer_end);
         buffer_end -= chunk_size;
-        memmove(&buffer[0], &buffer[chunk_size], buffer_end);
+        memmove(buffer.get(), buffer.get() + chunk_size, buffer_end);
         bytes_left -= bytes_to_read;
     }
     // finalize
     while (buffer_end > 0) {
-        chunk_size = create_chunk(hashes, buffer.data(), buffer_end);
+        chunk_size = create_chunk(hashes, buffer.get(), buffer_end);
         buffer_end -= chunk_size;
-        memmove(&buffer[0], &buffer[chunk_size], buffer_end);
+        memmove(buffer.get(), buffer.get() + chunk_size, buffer_end);
     }
     return;
 }

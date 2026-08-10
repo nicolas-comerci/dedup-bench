@@ -52,10 +52,15 @@ Gear_Chunking::Gear_Chunking(const Config& config) {
         mask = mask << 1;
     }
 
-    simd_mode = config.get_simd_mode();
+	simd_mode = config.get_simd_mode();
 	use_64bit_gear = config.get_use_64bit_gear();
+	use_low_bit_mask = config.get_gear_use_low_bit_mask();
 	if (simd_mode != SIMD_Mode::NONE && use_64bit_gear) {
 		throw ConfigError("64-bit Gear is unsupported for SSCDC");
+	}
+	if (simd_mode != SIMD_Mode::NONE && use_low_bit_mask) {
+		throw ConfigError(
+			"Low-bit Gear masks are always enabled on SIMD modes");
 	}
 	optimization_level = config.get_sscdc_optimization_level();
 }
@@ -1376,27 +1381,34 @@ uint64_t Gear_Chunking::find_cutpoint_serial(char* data, uint64_t size) {
     return size;
   }
 
+  const uint64_t limit = std::min(size, max_block_size);
+
   if (use_64bit_gear) {
     uint64_t hash = 0;
+    const uint64_t serial_mask = use_low_bit_mask
+        ? avg_block_size - 1
+        : mask;
   	while (idx < min_block_size) {
   		hash = gear_common::roll(hash, static_cast<uint8_t>(data[idx]));
   		idx += 1;
   	}
-    while (idx < size && idx < max_block_size) {
+    while (idx < limit) {
       hash = gear_common::roll(hash, static_cast<uint8_t>(data[idx]));
-      if (!(hash & mask)) {
+      if (!(hash & serial_mask)) {
         return idx;
       }
       idx += 1;
     }
   } else {
     uint32_t hash = 0;
-    const uint32_t mask_32 = static_cast<uint32_t>(mask >> 32);
+    const uint32_t mask_32 = use_low_bit_mask
+        ? static_cast<uint32_t>(avg_block_size - 1)
+        : static_cast<uint32_t>(mask >> 32);
   	while (idx < min_block_size) {
   		hash = gear_common::roll(hash, static_cast<uint8_t>(data[idx]));
   		idx += 1;
   	}
-    while (idx < size && idx < max_block_size) {
+    while (idx < limit) {
       hash = gear_common::roll(hash, static_cast<uint8_t>(data[idx]));
       if (!(hash & mask_32)) {
         return idx;
