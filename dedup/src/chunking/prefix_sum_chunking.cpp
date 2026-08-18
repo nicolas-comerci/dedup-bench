@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <string>
 
 #include <immintrin.h>
 
@@ -71,6 +72,30 @@ Prefix_Sum_Chunking::Prefix_Sum_Chunking(const Config& config) {
             (uint64_t{1} << (mask_bits - normalization_level)) - 1;
     }
     backup_mask = large_mask >> 1;
+
+    if (!use_64bit_prefix_sum) {
+        const uint64_t widest_mask = normalization_level != 0
+            ? small_mask
+            : mask;
+        uint32_t maximum_mask_shift = 0;
+        const char* simd_name = nullptr;
+        if (simd_mode == SIMD_Mode::AVX256) {
+            maximum_mask_shift = 7;
+            simd_name = "AVX2";
+        } else if (simd_mode == SIMD_Mode::AVX512) {
+            maximum_mask_shift = 15;
+            simd_name = "AVX-512";
+        }
+        if (simd_name != nullptr
+            && widest_mask
+                > (static_cast<uint64_t>(
+                       std::numeric_limits<uint32_t>::max())
+                   >> maximum_mask_shift)) {
+            throw ConfigError(
+                std::string("32-bit Prefix Sum ") + simd_name
+                + " masks are too wide for exact per-lane shifting");
+        }
+    }
     technique_name = "prefix_sum";
 }
 template <typename FingerprintType, bool UseGearTable>
@@ -277,18 +302,36 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_serial(
 }
 
 #if defined(__AVX2__)
-static inline __m256i inclusive_prefix_sum_avx2(__m256i values) {
-    __m256i sums = values;
+static inline __m256i scale_contributions_avx2(
+    __m256i values, __m256i lane_shifts) {
+    return _mm256_sllv_epi32(values, lane_shifts);
+}
+
+static inline __m256i scale_mask_avx2(
+    __m256i mask, __m256i lane_shifts) {
+    return _mm256_sllv_epi32(mask, lane_shifts);
+}
+
+static inline __m256i inclusive_prefix_sum_avx2(
+    __m256i values, __m256i lane_shifts) {
+    // Scaling by descending powers of two turns the rolling recurrence into
+    // an ordinary prefix sum. The masks use the same scale below.
+    __m256i sums = scale_contributions_avx2(values, lane_shifts);
     sums = _mm256_add_epi32(
-        sums, _mm256_slli_epi32(_mm256_slli_si256(sums, 4), 1));
+        sums, _mm256_slli_si256(sums, 4));
     sums = _mm256_add_epi32(
-        sums, _mm256_slli_epi32(_mm256_slli_si256(sums, 8), 2));
+        sums, _mm256_slli_si256(sums, 8));
 
     __m256i carry = _mm256_permute2x128_si256(sums, sums, 0x08);
     carry = _mm256_shuffle_epi32(carry, 0xff);
-    carry = _mm256_sllv_epi32(
-        carry, _mm256_setr_epi32(0, 0, 0, 0, 1, 2, 3, 4));
     return _mm256_add_epi32(sums, carry);
+}
+
+static inline void schedule_batch_avx2(
+    __m256i (&values)[optimization_batch_size]) {
+    asm volatile(""
+                 : "+v"(values[0]), "+v"(values[1]),
+                   "+v"(values[2]), "+v"(values[3]));
 }
 
 static inline __m256i inclusive_prefix_sum_64_avx2(__m256i values) {
@@ -302,10 +345,36 @@ static inline __m256i inclusive_prefix_sum_64_avx2(__m256i values) {
 }
 
 static inline void prefix_sum_batch_32_avx2(
-    __m256i (&sums)[optimization_batch_size]) {
+    __m256i (&sums)[optimization_batch_size], __m256i lane_shifts) {
     for (auto& value : sums) {
-        value = inclusive_prefix_sum_avx2(value);
+        value = scale_contributions_avx2(value, lane_shifts);
     }
+    schedule_batch_avx2(sums);
+
+    for (auto& value : sums) {
+        value = _mm256_add_epi32(value, _mm256_slli_si256(value, 4));
+    }
+    schedule_batch_avx2(sums);
+
+    for (auto& value : sums) {
+        value = _mm256_add_epi32(value, _mm256_slli_si256(value, 8));
+    }
+    schedule_batch_avx2(sums);
+
+    __m256i carries[optimization_batch_size];
+    for (uint32_t i = 0; i < optimization_batch_size; ++i) {
+        carries[i] = _mm256_permute2x128_si256(sums[i], sums[i], 0x08);
+    }
+    schedule_batch_avx2(carries);
+    for (auto& carry : carries) {
+        carry = _mm256_shuffle_epi32(carry, 0xff);
+    }
+    schedule_batch_avx2(carries);
+
+    for (uint32_t i = 0; i < optimization_batch_size; ++i) {
+        sums[i] = _mm256_add_epi32(sums[i], carries[i]);
+    }
+    schedule_batch_avx2(sums);
 }
 
 static inline void prefix_sum_batch_64_avx2(
@@ -444,7 +513,8 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx2(
 
     uint32_t sum = initialize_fingerprint<
         uint32_t, UseGearTable, SkipSubminimum, RepairContext>(data, idx);
-    const __m256i base_shifts = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i lane_shifts = _mm256_setr_epi32(
+        7, 6, 5, 4, 3, 2, 1, 0);
 
     for (uint32_t phase = 0;
          phase < (Normalize || UseBackup ? 2u : 1u); ++phase) {
@@ -455,20 +525,22 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx2(
         const uint32_t phase_mask = static_cast<uint32_t>(Normalize
             ? (phase == 0 ? small_mask : large_mask)
             : mask);
-        const __m256i mask_vector =
-            _mm256_set1_epi32(static_cast<int>(phase_mask));
+        const __m256i mask_vector = scale_mask_avx2(
+            _mm256_set1_epi32(static_cast<int>(phase_mask)),
+            lane_shifts);
+        const __m256i backup_mask_vector = scale_mask_avx2(
+            _mm256_set1_epi32(static_cast<int>(backup_mask)),
+            lane_shifts);
         if constexpr (Lookahead) {
             while (idx + 8 * optimization_batch_size <= phase_limit) {
             __m256i local_sums[optimization_batch_size];
             load_contribution_batch_32_avx2<UseGearTable>(
                     data + idx, local_sums);
-            prefix_sum_batch_32_avx2(local_sums);
+            prefix_sum_batch_32_avx2(local_sums, lane_shifts);
             for (uint32_t block = 0; block < optimization_batch_size; ++block) {
                 const __m256i sums = _mm256_add_epi32(
                     local_sums[block],
-                    _mm256_sllv_epi32(
-                        _mm256_set1_epi32(static_cast<int>(sum)),
-                        base_shifts));
+                    _mm256_set1_epi32(static_cast<int>(sum << 8)));
                 const __m256i matches = _mm256_cmpeq_epi32(
                     _mm256_and_si256(sums, mask_vector), zero);
                 const uint32_t match_mask = static_cast<uint32_t>(
@@ -478,9 +550,6 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx2(
                 }
                 if constexpr (UseBackup) {
                     if (phase == 1 && backup_idx == 0) {
-                        const __m256i backup_mask_vector =
-                            _mm256_set1_epi32(
-                                static_cast<int>(backup_mask));
                         const __m256i backup_matches = _mm256_cmpeq_epi32(
                             _mm256_and_si256(sums, backup_mask_vector), zero);
                         const uint32_t backup_matches_mask =
@@ -502,9 +571,8 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx2(
         const __m256i incoming =
             load_contributions_32_avx2<UseGearTable>(data + idx);
         const __m256i sums = _mm256_add_epi32(
-            inclusive_prefix_sum_avx2(incoming),
-            _mm256_sllv_epi32(
-                _mm256_set1_epi32(static_cast<int>(sum)), base_shifts));
+            inclusive_prefix_sum_avx2(incoming, lane_shifts),
+            _mm256_set1_epi32(static_cast<int>(sum << 8)));
         const __m256i matches = _mm256_cmpeq_epi32(
             _mm256_and_si256(sums, mask_vector), zero);
         const unsigned int match_mask = static_cast<unsigned int>(
@@ -514,8 +582,6 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx2(
         }
         if constexpr (UseBackup) {
             if (phase == 1 && backup_idx == 0) {
-                const __m256i backup_mask_vector = _mm256_set1_epi32(
-                    static_cast<int>(backup_mask));
                 const __m256i backup_matches = _mm256_cmpeq_epi32(
                     _mm256_and_si256(sums, backup_mask_vector), zero);
                 const uint32_t backup_matches_mask =
@@ -551,6 +617,86 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx2(
 #endif
 
 #if defined(__AVX512F__)
+uint64_t Prefix_Sum_Chunking::find_cutpoint_actually_just_prefixsum_avx512(
+    const unsigned char* data, uint64_t size) const {
+    if (size <= min_block_size) {
+        return size;
+    }
+
+    constexpr uint64_t window_size = 32;
+    const uint64_t limit = std::min(size, max_block_size);
+    const __m512i zero = _mm512_setzero_si512();
+    const uint32_t window_mask = static_cast<uint32_t>(
+        std::max<uint64_t>(avg_block_size / window_size, 1) - 1);
+    const __m512i mask_vector = _mm512_set1_epi32(
+        static_cast<int>(window_mask));
+    const __m512i lane_shifts = _mm512_setr_epi32(
+        15, 14, 13, 12, 11, 10, 9, 8,
+        7, 6, 5, 4, 3, 2, 1, 0);
+
+    uint32_t sum = 0;
+    uint64_t idx = min_block_size > window_size
+        ? min_block_size - window_size
+        : 0;
+
+    while (idx < min_block_size) {
+        sum += data[idx];
+        ++idx;
+    }
+
+    while (idx < limit && idx < window_size) {
+        sum += data[idx];
+        if ((sum & window_mask) == 0) {
+            return idx;
+        }
+        ++idx;
+    }
+
+    while (idx + 16 <= limit) {
+        // Each lane is the change between consecutive 32-byte windows.
+        const __m128i incoming_bytes = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(data + idx));
+        __m512i sums = _mm512_cvtepu8_epi32(incoming_bytes);
+
+        // Prefix-summing the changes produces all 16 rolling window sums.
+        sums = _mm512_sllv_epi32(sums, lane_shifts);
+        sums = _mm512_add_epi32(
+            sums, _mm512_alignr_epi32(sums, zero, 15));
+        sums = _mm512_add_epi32(
+            sums, _mm512_alignr_epi32(sums, zero, 14));
+        sums = _mm512_add_epi32(
+            sums, _mm512_alignr_epi32(sums, zero, 12));
+        sums = _mm512_add_epi32(
+            sums, _mm512_alignr_epi32(sums, zero, 8));
+        sums = _mm512_add_epi32(
+            sums, _mm512_set1_epi32(static_cast<int>(sum)));
+
+        // Check for results
+        const __mmask16 matches = _mm512_cmpeq_epi32_mask(
+            _mm512_and_si512(sums, mask_vector), zero);
+        if (matches != 0) {
+            return idx + static_cast<uint64_t>(
+                __builtin_ctz(static_cast<uint32_t>(matches)));
+        }
+
+        const __m128i final_quarter =
+            _mm512_extracti32x4_epi32(sums, 3);
+        sum = static_cast<uint32_t>(_mm_extract_epi32(final_quarter, 3));
+        idx += 16;
+    }
+
+    while (idx < limit) {
+        sum -= data[idx - window_size];
+        sum += data[idx];
+        if ((sum & window_mask) == 0) {
+            return idx;
+        }
+        ++idx;
+    }
+
+    return limit;
+}
+
 template <int LaneShift>
 static inline __m512i shift_lanes_left_avx512(__m512i values) {
     static_assert(LaneShift > 0 && LaneShift < 16,
@@ -567,17 +713,37 @@ static inline __m512i shift_64bit_lanes_left_avx512(__m512i values) {
         values, _mm512_setzero_si512(), 8 - LaneShift);
 }
 
-static inline __m512i inclusive_prefix_sum_avx512(__m512i values) {
-    __m512i sums = values;
+static inline __m512i scale_contributions_avx512(
+    __m512i values, __m512i lane_shifts) {
+    return _mm512_sllv_epi32(values, lane_shifts);
+}
+
+static inline __m512i scale_mask_avx512(
+    __m512i mask, __m512i lane_shifts) {
+    return _mm512_sllv_epi32(mask, lane_shifts);
+}
+
+static inline __m512i inclusive_prefix_sum_avx512(
+    __m512i values, __m512i lane_shifts) {
+    // Scaling by descending powers of two turns the rolling recurrence into
+    // an ordinary prefix sum. The masks use the same scale below.
+    __m512i sums = scale_contributions_avx512(values, lane_shifts);
     sums = _mm512_add_epi32(
-        sums, _mm512_slli_epi32(shift_lanes_left_avx512<1>(sums), 1));
+        sums, shift_lanes_left_avx512<1>(sums));
     sums = _mm512_add_epi32(
-        sums, _mm512_slli_epi32(shift_lanes_left_avx512<2>(sums), 2));
+        sums, shift_lanes_left_avx512<2>(sums));
     sums = _mm512_add_epi32(
-        sums, _mm512_slli_epi32(shift_lanes_left_avx512<4>(sums), 4));
+        sums, shift_lanes_left_avx512<4>(sums));
     sums = _mm512_add_epi32(
-        sums, _mm512_slli_epi32(shift_lanes_left_avx512<8>(sums), 8));
+        sums, shift_lanes_left_avx512<8>(sums));
     return sums;
+}
+
+static inline void schedule_batch_avx512(
+    __m512i (&values)[optimization_batch_size]) {
+    asm volatile(""
+                 : "+v"(values[0]), "+v"(values[1]),
+                   "+v"(values[2]), "+v"(values[3]));
 }
 
 static inline __m512i inclusive_prefix_sum_64_avx512(__m512i values) {
@@ -595,10 +761,32 @@ static inline __m512i inclusive_prefix_sum_64_avx512(__m512i values) {
 }
 
 static inline void prefix_sum_batch_32_avx512(
-    __m512i (&sums)[optimization_batch_size]) {
+    __m512i (&sums)[optimization_batch_size], __m512i lane_shifts) {
     for (auto& value : sums) {
-        value = inclusive_prefix_sum_avx512(value);
+        value = scale_contributions_avx512(value, lane_shifts);
     }
+    schedule_batch_avx512(sums);
+
+    for (auto& value : sums) {
+        value = _mm512_add_epi32(
+            value, shift_lanes_left_avx512<1>(value));
+    }
+    schedule_batch_avx512(sums);
+    for (auto& value : sums) {
+        value = _mm512_add_epi32(
+            value, shift_lanes_left_avx512<2>(value));
+    }
+    schedule_batch_avx512(sums);
+    for (auto& value : sums) {
+        value = _mm512_add_epi32(
+            value, shift_lanes_left_avx512<4>(value));
+    }
+    schedule_batch_avx512(sums);
+    for (auto& value : sums) {
+        value = _mm512_add_epi32(
+            value, shift_lanes_left_avx512<8>(value));
+    }
+    schedule_batch_avx512(sums);
 }
 
 static inline void prefix_sum_batch_64_avx512(
@@ -779,8 +967,9 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx512(
 
     uint32_t sum = initialize_fingerprint<
         uint32_t, UseGearTable, SkipSubminimum, RepairContext>(data, idx);
-    const __m512i base_shifts = _mm512_setr_epi32(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+    const __m512i lane_shifts = _mm512_setr_epi32(
+        15, 14, 13, 12, 11, 10, 9, 8,
+        7, 6, 5, 4, 3, 2, 1, 0);
     const __m512i zero = _mm512_setzero_si512();
 
     for (uint32_t phase = 0;
@@ -792,19 +981,22 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx512(
         const uint32_t phase_mask = static_cast<uint32_t>(Normalize
             ? (phase == 0 ? small_mask : large_mask)
             : mask);
-        const __m512i mask_vector =
-            _mm512_set1_epi32(static_cast<int>(phase_mask));
+        const __m512i mask_vector = scale_mask_avx512(
+            _mm512_set1_epi32(static_cast<int>(phase_mask)),
+            lane_shifts);
+        const __m512i backup_mask_vector = scale_mask_avx512(
+            _mm512_set1_epi32(static_cast<int>(backup_mask)),
+            lane_shifts);
         if constexpr (Lookahead) {
             while (idx + 16 * optimization_batch_size <= phase_limit) {
             __m512i local_sums[optimization_batch_size];
             load_contribution_batch_32_avx512<UseGearTable>(
                     data + idx, local_sums);
-            prefix_sum_batch_32_avx512(local_sums);
+            prefix_sum_batch_32_avx512(local_sums, lane_shifts);
             for (uint32_t block = 0; block < optimization_batch_size; ++block) {
                 const __m512i sums = _mm512_add_epi32(
                     local_sums[block],
-                    _mm512_sllv_epi32(
-                        _mm512_set1_epi32(static_cast<int>(sum)), base_shifts));
+                    _mm512_set1_epi32(static_cast<int>(sum << 16)));
                 const __mmask16 matches = _mm512_cmpeq_epi32_mask(
                     _mm512_and_si512(sums, mask_vector), zero);
                 if (matches != 0) {
@@ -816,8 +1008,7 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx512(
                         const __mmask16 backup_matches =
                             _mm512_cmpeq_epi32_mask(
                                 _mm512_and_si512(
-                                    sums, _mm512_set1_epi32(
-                                        static_cast<int>(backup_mask))),
+                                    sums, backup_mask_vector),
                                 zero);
                         if (backup_matches != 0) {
                             backup_idx = idx + block * 16
@@ -839,9 +1030,8 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx512(
         const __m512i incoming =
             load_contributions_32_avx512<UseGearTable>(data + idx);
         const __m512i sums = _mm512_add_epi32(
-            inclusive_prefix_sum_avx512(incoming),
-            _mm512_sllv_epi32(
-                _mm512_set1_epi32(static_cast<int>(sum)), base_shifts));
+            inclusive_prefix_sum_avx512(incoming, lane_shifts),
+            _mm512_set1_epi32(static_cast<int>(sum << 16)));
         const __mmask16 matches = _mm512_cmpeq_epi32_mask(
             _mm512_and_si512(sums, mask_vector), zero);
         if (matches != 0) {
@@ -851,8 +1041,7 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint_avx512(
             if (phase == 1 && backup_idx == 0) {
                 const __mmask16 backup_matches = _mm512_cmpeq_epi32_mask(
                     _mm512_and_si512(
-                        sums, _mm512_set1_epi32(
-                            static_cast<int>(backup_mask))), zero);
+                        sums, backup_mask_vector), zero);
                 if (backup_matches != 0) {
                     backup_idx = idx + first_set_bit(
                         static_cast<uint32_t>(backup_matches));
@@ -959,6 +1148,16 @@ uint64_t Prefix_Sum_Chunking::find_cutpoint(char* data, uint64_t size) {
 #endif
 #if defined(__AVX512F__)
         case SIMD_Mode::AVX512:
+            if (!use_64bit_prefix_sum
+                && !use_gear_table_lookup
+                && !use_subminimum_skipping
+                && !use_context_repair
+                && !contribution_lookahead
+                && normalization_level == 0
+                && !use_supercdc_backup) {
+                return find_cutpoint_actually_just_prefixsum_avx512(
+                    bytes, size);
+            }
             DISPATCH_OPTIMIZED(find_cutpoint_avx512);
             break;
 #endif
