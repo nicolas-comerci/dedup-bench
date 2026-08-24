@@ -36,9 +36,6 @@ class Prefix_Sum_Chunking : public virtual Chunking_Technique {
 #endif
 
 #if defined(__AVX512F__)
-    uint64_t find_cutpoint_actually_just_prefixsum_avx512(
-        const unsigned char* data, uint64_t size) const;
-
     template <bool UseGearTable, bool SkipSubminimum, bool RepairContext,
               bool Lookahead, bool Normalize, bool UseBackup>
     uint64_t find_cutpoint_avx512(

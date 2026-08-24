@@ -236,6 +236,16 @@ with a low-bit cut mask. By default, `value` is the unsigned input byte; setting
 `gear_use_low_bit_mask=true` in serial mode to produce equivalent boundaries
 to the table-lookup variant. `use_gear_table_lookup` defaults to `false`.
 
+The 32-bit AVX256 and AVX512 implementations use a FastCDC-inspired SIMD
+transformation. They left-shift the contributions by descending lane counts,
+compute an ordinary prefix sum, add the incoming fingerprint at the batch
+width, and judge the scaled fingerprints against masks shifted by the same
+lane counts. The final lane is unshifted and becomes the exact carry for the
+next batch. Raw Prefix Sum widens the input bytes directly; the compile-time
+`use_gear_table_lookup=false` specialization removes the Gear-table gather.
+Contribution lookahead applies the same calculation to four independent
+batches so their instruction chains can overlap.
+
 Prefix Sum defaults to `use_subminimum_skipping=true`, which starts the
 fingerprint initialization near `prefix_sum_min_block_size` instead of hashing
 the complete prefix that cannot produce a cut. `use_context_repair=true` is
@@ -243,8 +253,10 @@ also the default: it hashes only the final 32 or 64 bytes before the minimum,
 according to the fingerprint width, without accepting cuts in that repair
 window. This restores the full-prefix fingerprint at the first eligible
 candidate. Set context repair to `false` to start from zero at the minimum, or
-disable subminimum skipping to hash the complete prefix; context repair is
-ignored when skipping is disabled. SIMD implementations also support
+disable subminimum skipping to preserve full-prefix fingerprint semantics;
+contributions older than the fingerprint width have already shifted out and
+do not need to be reread. Context repair is ignored when skipping is disabled.
+SIMD implementations also support
 `prefix_sum_contribution_lookahead`: it defaults to `true` for raw Prefix Sum
 and `false` when `use_gear_table_lookup=true`. Lookahead is rejected with
 `simd_mode=none`. Prefix Sum also accepts FastCDC normalization through
@@ -254,10 +266,7 @@ from the average size onward. Omitting these properties leaves Prefix Sum
 unnormalized. `use_supercdc_backup=true` additionally enables SuperCDC's
 post-average fallback condition. It remembers the first backup-only match and
 uses it only if no normal cut is found before the maximum size; the option
-defaults to `false`. The two-option benchmark matrix can be run with
-`python3 supporting_tools/benchmark_prefix_sum_optimizations.py <dataset>`;
-it uses temporary configs and writes raw trials plus a median summary under
-`build/` by default.
+defaults to `false`.
 
 ### Hashing Techniques
 The following hashing techniques are currently supported by DedupBench. Note that the `hashing_algo` parameter in the configuration file needs to be edited to switch techniques.
