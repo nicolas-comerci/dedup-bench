@@ -19,10 +19,6 @@ class Cdcz_Chunking : public virtual Chunking_Technique {
     SIMD_Mode simd_mode;
     bool use_64bit_gear;
 
-    // for ss-cdc
-    uint64_t file_size;
-    uint8_t* cutpoint_bitmap = nullptr;
-    chunk_boundary cb{};
     uint64_t optimization_level;
 
 
@@ -42,7 +38,6 @@ class Cdcz_Chunking : public virtual Chunking_Technique {
     uint64_t find_cutpoint(char* buff, uint64_t size) override;
 
     uint64_t find_cutpoint_serial(char* buff, uint64_t size);
-    uint64_t find_cutpoint_avx512(char* buff, uint64_t size);
 
 
    public:
