@@ -64,6 +64,32 @@ Cdcz_Chunking::Cdcz_Chunking(const Config& config) {
 
 #define GEAR_HASHLEN 32
 
+static constexpr uint64_t CDCZ_WINDOW_SIZE = 1ull << 30;
+
+struct CdczWindowLayout {
+	uint64_t window_bytes;
+	uint64_t bytes_per_lane_without_overlap;
+	uint64_t bytes_per_lane;
+};
+
+static CdczWindowLayout make_cdcz_window_layout(
+		uint64_t bytes_available, uint32_t lane_count) {
+	assert(bytes_available <= CDCZ_WINDOW_SIZE);
+	assert(bytes_available > GEAR_HASHLEN);
+	assert(lane_count > 0);
+
+	const uint64_t requested_window_bytes =
+		std::min<uint64_t>(CDCZ_WINDOW_SIZE, bytes_available);
+	const uint64_t bytes_per_lane_without_overlap =
+		(((requested_window_bytes - GEAR_HASHLEN) / lane_count) /
+			GEAR_HASHLEN) * GEAR_HASHLEN;
+	const uint64_t bytes_per_lane =
+		bytes_per_lane_without_overlap + GEAR_HASHLEN;
+	const uint64_t window_bytes =
+		(bytes_per_lane_without_overlap * lane_count) + GEAR_HASHLEN;
+	return {window_bytes, bytes_per_lane_without_overlap, bytes_per_lane};
+}
+
 inline void* portable_aligned_alloc(std::size_t alignment, std::size_t size) {
 	if (alignment == 0) {
 		return nullptr;
@@ -182,6 +208,8 @@ static inline void load_and_transpose_16x8_epi32_avx512(
 	__m512i (&columns)[8]);
 
 template<bool SCHEDULE_GATHERS, bool USE_LOAD_TRANSPOSE>
+// PRECONDITION: file_size fits in one CDCZ window, so every SIMD lane offset
+// fits in a signed 32-bit index.
 static void cdcz_chunking_phase_one_avx512_gear_impl(
 	uint32_t mask,
 	uint64_t avg_block_size,
@@ -248,16 +276,12 @@ static void cdcz_chunking_phase_one_avx512_gear_impl(
 	};
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {  // if bytes left are too few just complete the remainder with serial version
-		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
-		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
-		// SS-CDC would only need GEAR_HASHLEN - 1 of overlap between lane/thread segments, but we just use GEAR_HASHLEN as its easier.
-		// Also ensure each lane has a even number of GEAR_HASHLEN bytes sets of data to roll GEAR to.
-		// This keeps candidate-mask processing efficient.
-		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
-		// Add GEAR_HASHLEN overlap and we still have an even number of GEAR_HASHLEN bytes=8 Gather instructions
-		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
-		// Readjust window_bytes as it might now be a few bytes smaller because of divisibility
-		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
+		const CdczWindowLayout window_layout =
+			make_cdcz_window_layout(total_bytes_left, LANE_COUNT);
+		const uint64_t window_bytes = window_layout.window_bytes;
+		const uint64_t bytes_per_lane_without_overlap =
+			window_layout.bytes_per_lane_without_overlap;
+		const uint64_t bytes_per_lane = window_layout.bytes_per_lane;
 
 		const uint64_t expected_candidates_per_lane =
 			((bytes_per_lane + avg_block_size - 1) / avg_block_size) + 2;
@@ -658,6 +682,8 @@ static inline void load_and_transpose_8x8_epi32_avx2(
 }
 
 // AVX2 version of CDCZ phase one. Sparse lane results are stored individually.
+// PRECONDITION: file_size fits in one CDCZ window, so every SIMD lane offset
+// fits in a signed 32-bit index.
 static void cdcz_chunking_phase_one_avx2_gear(
 	uint32_t mask,
 	uint64_t avg_block_size,
@@ -725,11 +751,12 @@ static void cdcz_chunking_phase_one_avx2_gear(
 	};
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
-		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
-		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
-		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
-		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
+		const CdczWindowLayout window_layout =
+			make_cdcz_window_layout(total_bytes_left, LANE_COUNT);
+		const uint64_t window_bytes = window_layout.window_bytes;
+		const uint64_t bytes_per_lane_without_overlap =
+			window_layout.bytes_per_lane_without_overlap;
+		const uint64_t bytes_per_lane = window_layout.bytes_per_lane;
 
 		const uint64_t expected_candidates_per_lane =
 			((bytes_per_lane + avg_block_size - 1) / avg_block_size) + 2;
@@ -971,6 +998,8 @@ static void cdcz_chunking_phase_one_avx2_gear(
 // Shared AVX2 CDCZ phase one for scheduled gathers and contiguous lane loads with transpose.
 // Sparse lane results are stored individually.
 template<bool USE_LOAD_TRANSPOSE>
+// PRECONDITION: file_size fits in one CDCZ window, so every SIMD lane offset
+// fits in a signed 32-bit index.
 static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 	uint32_t mask,
 	uint64_t avg_block_size,
@@ -1037,11 +1066,12 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 	};
 
 	while (total_bytes_left > std::max<uint64_t>(2ull * LANE_COUNT * GEAR_HASHLEN, min_block_size)) {
-		// Ensure the window offsets don't overflow (2GB is the max i32 value, 1GB is good enough)
-		uint64_t window_bytes = std::min<uint64_t>(1 << 30, total_bytes_left);
-		const uint64_t bytes_per_lane_without_overlap = (((window_bytes - GEAR_HASHLEN) / LANE_COUNT) / GEAR_HASHLEN) * GEAR_HASHLEN;
-		const uint64_t bytes_per_lane = bytes_per_lane_without_overlap + GEAR_HASHLEN;
-		window_bytes = (bytes_per_lane_without_overlap * LANE_COUNT) + GEAR_HASHLEN;
+		const CdczWindowLayout window_layout =
+			make_cdcz_window_layout(total_bytes_left, LANE_COUNT);
+		const uint64_t window_bytes = window_layout.window_bytes;
+		const uint64_t bytes_per_lane_without_overlap =
+			window_layout.bytes_per_lane_without_overlap;
+		const uint64_t bytes_per_lane = window_layout.bytes_per_lane;
 
 		const uint64_t expected_candidates_per_lane =
 			((bytes_per_lane + avg_block_size - 1) / avg_block_size) + 2;
@@ -1453,12 +1483,31 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 	if (simd_mode == SIMD_Mode::NONE) {
 		return Chunking_Technique::chunk_file(file_path);
 	}
+	std::vector<std::string> hashes;
+	chunk_file(file_path, [&hashes](const std::string& hash) {
+		hashes.emplace_back(hash);
+	});
+	return hashes;
+}
+
+uint64_t Cdcz_Chunking::chunk_file(
+		std::string file_path, const Chunk_Result_Consumer& consumer) {
+	if (simd_mode == SIMD_Mode::NONE) {
+		std::vector<std::string> hashes =
+			Chunking_Technique::chunk_file(file_path);
+		for (const auto& hash : hashes) {
+			consumer(hash);
+		}
+		return hashes.size();
+	}
 
 	using phase_one_function = void (*)(uint32_t, uint64_t, uint64_t, uint64_t, const unsigned char*, uint64_t, std::vector<uint64_t>&);
 	phase_one_function phase_one = nullptr;
+	uint32_t lane_count = 0;
 	switch (simd_mode) {
 	#if defined(__AVX2__)
 		case SIMD_Mode::AVX256: {
+			lane_count = 8;
 			switch (optimization_level) {
 				case 1:
 					phase_one = cdcz_chunking_phase_one_avx2_gear_with_gather_scheduling;
@@ -1475,6 +1524,7 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 	#endif
 	#if defined(__AVX512F__)
 		case SIMD_Mode::AVX512: {
+			lane_count = 16;
 			switch (optimization_level) {
 				case 1:
 					phase_one = cdcz_chunking_phase_one_avx512_gear_with_gather_scheduling;
@@ -1507,16 +1557,18 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 		throw std::runtime_error("Failed to determine file size: " + file_path);
 	}
 	const uint64_t file_size = static_cast<uint64_t>(end_position);
-	file_ptr.seekg(0, std::ios_base::beg);
-	if (!file_ptr) {
-		throw std::runtime_error("Failed to seek file: " + file_path);
+	const CdczWindowLayout maximum_window =
+		make_cdcz_window_layout(CDCZ_WINDOW_SIZE, lane_count);
+	if (max_block_size >= maximum_window.window_bytes) {
+		throw std::runtime_error(
+			"CDCZ maximum chunk size must be smaller than its processing window");
 	}
-
-	std::vector<uint64_t> cutpoints{};
+	const uint64_t window_capacity =
+		std::min(file_size, maximum_window.window_bytes);
 
 	using aligned_buffer = std::unique_ptr<unsigned char, decltype(&portable_aligned_free)>;
 	aligned_buffer file_data_owner(
-		static_cast<unsigned char*>(portable_aligned_alloc(64, file_size)),
+		static_cast<unsigned char*>(portable_aligned_alloc(64, window_capacity)),
 		&portable_aligned_free
 	);
 	if (!file_data_owner) {
@@ -1524,11 +1576,8 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 		exit(2);
 	}
 	unsigned char* const file_data = file_data_owner.get();
-	if (!read_exact(file_ptr, reinterpret_cast<char*>(file_data), file_size)) {
-		throw std::runtime_error("Failed to read complete file: " + file_path);
-	}
+	std::vector<uint64_t> cutpoints;
 
-	auto begin_chunking = std::chrono::high_resolution_clock::now();
 	// mask was made for 64bits on the most significant bits, shift and cast to 32bit
 	const uint32_t avg_mask = static_cast<uint32_t>(mask >> 32);
 #ifndef NDEBUG
@@ -1537,58 +1586,98 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 	const uint32_t easy_mask = debug_masks.easy;
 	const uint32_t backup_mask = debug_masks.backup;
 #endif
-	phase_one(avg_mask, avg_block_size, min_block_size, max_block_size, file_data, file_size, cutpoints);
-	auto end_chunking = std::chrono::high_resolution_clock::now();
-	total_time_chunking += (end_chunking - begin_chunking);
 
-	std::vector<std::string> hashes{};
-	uint64_t prev_cut_offset = 0;
-	for (uint64_t cutpoint : cutpoints) {
-#ifndef NDEBUG
-		// DEBUG: serially check next chunk size, crash if there is a mismatch
-		auto debug_curr_pos = prev_cut_offset;
-		uint64_t debug_backup_pos = std::numeric_limits<uint64_t>::max();
-		uint32_t hash = 0;
-		for (; debug_curr_pos < file_size; debug_curr_pos++) {
-			hash = (hash << 1) + gear_common::table_32[file_data[debug_curr_pos]];
-			const uint64_t debug_chunk_size = debug_curr_pos - prev_cut_offset;
-			if (debug_chunk_size >= avg_block_size && debug_chunk_size < max_block_size &&
-				debug_backup_pos == std::numeric_limits<uint64_t>::max() && !(hash & backup_mask)) debug_backup_pos = debug_curr_pos;
-			const bool normalized_match =
-				(debug_chunk_size >= min_block_size && debug_chunk_size < avg_block_size && !(hash & hard_mask)) ||
-				(debug_chunk_size >= avg_block_size && !(hash & easy_mask));
-			if (debug_chunk_size == max_block_size) {
-				if (debug_backup_pos != std::numeric_limits<uint64_t>::max()) debug_curr_pos = debug_backup_pos;
+	uint64_t emitted_chunks = 0;
+	uint64_t global_offset = 0;
+	while (global_offset < file_size) {
+		const uint64_t bytes_remaining = file_size - global_offset;
+		const uint64_t bytes_in_window =
+			std::min(window_capacity, bytes_remaining);
+		const bool final_window = bytes_in_window == bytes_remaining;
+
+		file_ptr.clear();
+		file_ptr.seekg(static_cast<std::streamoff>(global_offset),
+			std::ios_base::beg);
+		if (!file_ptr || !read_exact(file_ptr,
+				reinterpret_cast<char*>(file_data), bytes_in_window)) {
+			throw std::runtime_error(
+				"Failed to read CDCZ processing window: " + file_path);
+		}
+
+		cutpoints.clear();
+		const auto begin_chunking =
+			std::chrono::high_resolution_clock::now();
+		phase_one(avg_mask, avg_block_size, min_block_size, max_block_size,
+			file_data, bytes_in_window, cutpoints);
+		const auto end_chunking =
+			std::chrono::high_resolution_clock::now();
+		total_time_chunking += (end_chunking - begin_chunking);
+
+		const uint64_t safe_cut_limit = final_window
+			? bytes_in_window : bytes_in_window - max_block_size;
+		uint64_t prev_cut_offset = 0;
+		for (uint64_t cutpoint : cutpoints) {
+			if (cutpoint > safe_cut_limit) {
 				break;
 			}
-			if (normalized_match) break;
-		}
-		uint64_t debug_chunk_size = debug_curr_pos - prev_cut_offset;
+			if (cutpoint <= prev_cut_offset || cutpoint > bytes_in_window) {
+				throw std::runtime_error(
+					"CDCZ produced a non-monotonic cutpoint");
+			}
+#ifndef NDEBUG
+			// DEBUG: serially check next chunk size, crash if there is a mismatch
+			auto debug_curr_pos = prev_cut_offset;
+			uint64_t debug_backup_pos = std::numeric_limits<uint64_t>::max();
+			uint32_t hash = 0;
+			for (; debug_curr_pos < bytes_in_window; debug_curr_pos++) {
+				hash = (hash << 1) + gear_common::table_32[file_data[debug_curr_pos]];
+				const uint64_t debug_chunk_size = debug_curr_pos - prev_cut_offset;
+				if (debug_chunk_size >= avg_block_size && debug_chunk_size < max_block_size &&
+					debug_backup_pos == std::numeric_limits<uint64_t>::max() && !(hash & backup_mask)) debug_backup_pos = debug_curr_pos;
+				const bool normalized_match =
+					(debug_chunk_size >= min_block_size && debug_chunk_size < avg_block_size && !(hash & hard_mask)) ||
+					(debug_chunk_size >= avg_block_size && !(hash & easy_mask));
+				if (debug_chunk_size == max_block_size) {
+					if (debug_backup_pos != std::numeric_limits<uint64_t>::max()) debug_curr_pos = debug_backup_pos;
+					break;
+				}
+				if (normalized_match) break;
+			}
+			uint64_t debug_chunk_size = debug_curr_pos - prev_cut_offset;
 #endif
 
-		uint64_t chunk_size = cutpoint - prev_cut_offset;
+			uint64_t chunk_size = cutpoint - prev_cut_offset;
 
 #ifndef NDEBUG
-		if (chunk_size != debug_chunk_size) {
-			fprintf(stderr, "FIXING BAD CHUNK WITH SERIAL VERSION!\n");
-			chunk_size = debug_chunk_size;
-			cutpoint = debug_curr_pos;
-		}
+			if (chunk_size != debug_chunk_size) {
+				fprintf(stderr, "FIXING BAD CHUNK WITH SERIAL VERSION!\n");
+				chunk_size = debug_chunk_size;
+				cutpoint = debug_curr_pos;
+			}
 #endif
 
-		File_Chunk new_chunk{ chunk_size };
-		memcpy(new_chunk.get_data(), file_data + prev_cut_offset, chunk_size);
-		if (!disable_hashing) {
-			auto begin_hashing = std::chrono::high_resolution_clock::now();
-			hash_method->hash_chunk(new_chunk);
-			auto end_hashing = std::chrono::high_resolution_clock::now();
-			total_time_hashing += (end_hashing - begin_hashing);
-		}
-		hashes.emplace_back(new_chunk.to_string());
+			File_Chunk new_chunk{ chunk_size };
+			memcpy(new_chunk.get_data(), file_data + prev_cut_offset, chunk_size);
+			if (!disable_hashing) {
+				auto begin_hashing = std::chrono::high_resolution_clock::now();
+				hash_method->hash_chunk(new_chunk);
+				auto end_hashing = std::chrono::high_resolution_clock::now();
+				total_time_hashing += (end_hashing - begin_hashing);
+			}
+			const std::string hash = new_chunk.to_string();
+			consumer(hash);
+			emitted_chunks++;
 
-		prev_cut_offset = cutpoint;
+			prev_cut_offset = cutpoint;
+		}
+
+		if (prev_cut_offset == 0) {
+			throw std::runtime_error(
+				"CDCZ processing window made no forward progress");
+		}
+		global_offset += prev_cut_offset;
 	}
-	return hashes;
+	return emitted_chunks;
 }
 
 uint64_t Cdcz_Chunking::find_cutpoint(char* data, uint64_t size) {
