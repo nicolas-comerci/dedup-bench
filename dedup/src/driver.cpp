@@ -90,17 +90,14 @@ static void driver_function(const std::filesystem::path& dir_path,
                       << std::endl;
             continue;
         }
-        // Chunk file using specified Chunking_Technique
-        std::vector<std::string> hashes =
-            chunk_method->chunk_file(file_path.string());
+        const uint64_t file_chunk_count = chunk_method->chunk_file(
+            file_path.string(),
+            [&out_file](const std::string& hash) {
+                out_file << hash << std::endl;
+            });
         // get the size of the file
         total_bytes += chunk_method->get_file_size(&file_ptr);
-        chunk_count += hashes.size();
-
-        for (const auto& hash : hashes) {
-            out_file << hash << std::endl;
-            // fc.print();
-        }
+        chunk_count += file_chunk_count;
     }
 
     out_file.close();

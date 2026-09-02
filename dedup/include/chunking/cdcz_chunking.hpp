@@ -59,6 +59,9 @@ class Cdcz_Chunking : public virtual Chunking_Technique {
      * @return A vector of File_Chuncks
      */
     std::vector<std::string> chunk_file(std::string file_path) override;
+
+    uint64_t chunk_file(
+        std::string file_path, const Chunk_Result_Consumer& consumer) override;
 };
 
 #endif

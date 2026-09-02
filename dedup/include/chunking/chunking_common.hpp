@@ -19,6 +19,7 @@
 #include <istream>
 #include <cstdint>
 #include <iostream>
+#include <functional>
 
 #include "hash.hpp"
 #include "config.hpp"
@@ -87,6 +88,11 @@ class Chunking_Technique{
          * @return: Vector of struct File_Chunk
          */
         virtual std::vector<std::string> chunk_file(std::string file_path);
+
+        using Chunk_Result_Consumer = std::function<void(const std::string&)>;
+
+        virtual uint64_t chunk_file(
+            std::string file_path, const Chunk_Result_Consumer& consumer);
         /**
          * @brief Chunk a stream using a chunking technique and append the struct File_Chunks from this operation
          * to the vector passed in

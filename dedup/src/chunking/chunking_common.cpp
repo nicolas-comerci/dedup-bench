@@ -168,6 +168,15 @@ std::vector<std::string> Chunking_Technique::chunk_file(std::string file_path) {
     return hashes;
 }
 
+uint64_t Chunking_Technique::chunk_file(
+        std::string file_path, const Chunk_Result_Consumer& consumer) {
+    std::vector<std::string> hashes = chunk_file(file_path);
+    for (const auto& hash : hashes) {
+        consumer(hash);
+    }
+    return hashes.size();
+}
+
 int64_t Chunking_Technique::create_chunk(std::vector<std::string>& hashes,
                                          char* buffer, uint64_t buffer_end) {
     //start timing chunking
