@@ -26,6 +26,9 @@
 #ifdef _WIN32
 #include <malloc.h>
 #endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #include <immintrin.h>
 
@@ -135,6 +138,157 @@ struct CutPointCandidate {
 	uint64_t offset;
 };
 
+class LaneCandidateResults {
+public:
+	void reset(uint64_t lane_start, uint64_t lane_span,
+			uint64_t expected_candidates) {
+		clear_and_release();
+		lane_start_ = lane_start;
+		lane_span_ = lane_span;
+		const uint64_t word_count = (lane_span + 63) / 64;
+		const uint64_t dense_bytes = word_count * sizeof(uint64_t) * 2;
+		const uint64_t threshold_bytes = dense_bytes + dense_bytes / 4;
+		sparse_limit_ = std::max<uint64_t>(1,
+			threshold_bytes / sizeof(CutPointCandidate));
+		reserve_sparse(std::min(expected_candidates, sparse_limit_));
+	}
+
+	bool empty() const {
+		return candidate_count_ == 0;
+	}
+
+	const CutPointCandidate& back() const {
+		assert(!empty());
+		return last_candidate_;
+	}
+
+	void push_back(CutPointCandidate candidate) {
+		assert(candidate.offset >= lane_start_);
+		assert(candidate.offset - lane_start_ < lane_span_);
+		assert(empty() || candidate.offset > last_candidate_.offset);
+
+		if (!dense_ && sparse_.size() >= sparse_limit_) {
+			convert_to_dense();
+		}
+		if (dense_) {
+			set_dense(candidate);
+		}
+		else {
+			if (sparse_.size() == sparse_.capacity()) {
+				const uint64_t doubled_capacity = sparse_.capacity() == 0
+					? 1 : sparse_.capacity() * 2;
+				reserve_sparse(std::min(sparse_limit_, doubled_capacity));
+			}
+			sparse_.push_back(candidate);
+		}
+		last_candidate_ = candidate;
+		candidate_count_++;
+	}
+
+	template<typename Consumer>
+	void for_each(const Consumer& consumer) const {
+		if (!dense_) {
+			for (const auto& candidate : sparse_) {
+				consumer(candidate);
+			}
+			return;
+		}
+
+		for (uint64_t word_i = 0; word_i < low_bits_.size(); word_i++) {
+			uint64_t candidates = low_bits_[word_i] | high_bits_[word_i];
+			while (candidates != 0) {
+				const uint32_t bit = trailing_zero_count(candidates);
+				const uint64_t bit_mask = 1ull << bit;
+				const bool low = (low_bits_[word_i] & bit_mask) != 0;
+				const bool high = (high_bits_[word_i] & bit_mask) != 0;
+				const CutPointCandidateType type = low && high
+					? CutPointCandidateType::MAX_SIZE
+					: (low ? CutPointCandidateType::HARD_CUT_MASK
+						: CutPointCandidateType::EASY_CUT_MASK);
+				consumer(CutPointCandidate{
+					type, lane_start_ + word_i * 64 + bit});
+				candidates &= candidates - 1;
+			}
+		}
+	}
+
+	void clear_and_release() {
+		std::vector<CutPointCandidate>().swap(sparse_);
+		std::vector<uint64_t>().swap(low_bits_);
+		std::vector<uint64_t>().swap(high_bits_);
+		dense_ = false;
+		candidate_count_ = 0;
+	}
+
+private:
+	static uint32_t trailing_zero_count(uint64_t value) {
+		assert(value != 0);
+#if defined(_MSC_VER) && defined(_M_X64)
+		unsigned long index;
+		_BitScanForward64(&index, value);
+		return static_cast<uint32_t>(index);
+#elif defined(__GNUC__) || defined(__clang__)
+		return static_cast<uint32_t>(__builtin_ctzll(value));
+#else
+		uint32_t count = 0;
+		while ((value & 1) == 0) {
+			value >>= 1;
+			count++;
+		}
+		return count;
+#endif
+	}
+
+	void reserve_sparse(uint64_t capacity) {
+		if (capacity > sparse_.capacity()) {
+			sparse_.reserve(static_cast<std::size_t>(capacity));
+		}
+	}
+
+	void set_dense(const CutPointCandidate& candidate) {
+		const uint64_t relative_offset = candidate.offset - lane_start_;
+		const uint64_t word_i = relative_offset / 64;
+		const uint64_t bit_mask = 1ull << (relative_offset % 64);
+		low_bits_[word_i] &= ~bit_mask;
+		high_bits_[word_i] &= ~bit_mask;
+		switch (candidate.type) {
+			case CutPointCandidateType::HARD_CUT_MASK:
+				low_bits_[word_i] |= bit_mask;
+				break;
+			case CutPointCandidateType::EASY_CUT_MASK:
+				high_bits_[word_i] |= bit_mask;
+				break;
+			default:
+				// Backup, maximum-size, and EOF cuts are all unconditional
+				// when lane results are consumed, so they share code 11.
+				low_bits_[word_i] |= bit_mask;
+				high_bits_[word_i] |= bit_mask;
+				break;
+		}
+	}
+
+	void convert_to_dense() {
+		const uint64_t word_count = (lane_span_ + 63) / 64;
+		low_bits_.assign(word_count, 0);
+		high_bits_.assign(word_count, 0);
+		for (const auto& candidate : sparse_) {
+			set_dense(candidate);
+		}
+		std::vector<CutPointCandidate>().swap(sparse_);
+		dense_ = true;
+	}
+
+	std::vector<CutPointCandidate> sparse_;
+	std::vector<uint64_t> low_bits_;
+	std::vector<uint64_t> high_bits_;
+	uint64_t lane_start_ = 0;
+	uint64_t lane_span_ = 0;
+	uint64_t sparse_limit_ = 1;
+	uint64_t candidate_count_ = 0;
+	CutPointCandidate last_candidate_{};
+	bool dense_ = false;
+};
+
 #if defined(__AVX2__) || defined(__AVX512F__) || !defined(NDEBUG)
 struct CdczMasks {
 	uint32_t hard;
@@ -220,7 +374,7 @@ static void cdcz_chunking_phase_one_avx512_gear_impl(
 	std::vector<uint64_t>& cutpoints
 ) {
 	static constexpr uint32_t LANE_COUNT = 16;
-	std::array<std::vector<CutPointCandidate>, LANE_COUNT> lane_results{};
+	std::array<LaneCandidateResults, LANE_COUNT> lane_results{};
 	std::array<bool, LANE_COUNT> lane_achieved_chunk_invariance{};
 	lane_achieved_chunk_invariance.fill(false);
 	lane_achieved_chunk_invariance[0] = true;
@@ -240,9 +394,9 @@ static void cdcz_chunking_phase_one_avx512_gear_impl(
 
 	const auto consume_lane_results = [&]() {
 		for (auto& lane_result : lane_results) {
-			for (const auto& candidate : lane_result) {
+			lane_result.for_each([&](const CutPointCandidate& candidate) {
 				if (candidate.offset <= prev_cut_offset) {
-					continue;
+					return;
 				}
 
 				while (candidate.offset - prev_cut_offset >= max_block_size) {
@@ -270,8 +424,8 @@ static void cdcz_chunking_phase_one_avx512_gear_impl(
 					prev_cut_offset = candidate.offset;
 					cutpoints.emplace_back(prev_cut_offset);
 				}
-			}
-			lane_result.clear();
+			});
+			lane_result.clear_and_release();
 		}
 	};
 
@@ -285,8 +439,10 @@ static void cdcz_chunking_phase_one_avx512_gear_impl(
 
 		const uint64_t expected_candidates_per_lane =
 			((bytes_per_lane + avg_block_size - 1) / avg_block_size) + 2;
-		for (auto& lane_result : lane_results) {
-			lane_result.reserve(expected_candidates_per_lane);
+		for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
+			lane_results[lane_i].reset(
+				file_data_offset + lane_i * bytes_per_lane_without_overlap,
+				bytes_per_lane, expected_candidates_per_lane);
 		}
 
 		__m512i vindex = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
@@ -528,6 +684,10 @@ static void cdcz_chunking_phase_one_avx512_gear_impl(
 		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		file_data_offset++;
 	}
+	lane_results[LANE_COUNT - 1].reset(file_data_offset,
+		file_size - file_data_offset,
+		((file_size - file_data_offset + avg_block_size - 1) /
+			avg_block_size) + 2);
 	// Finish the remaining data and add results to the cutpoint list.
 	while (file_data_offset < file_size) {
 		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
@@ -694,7 +854,7 @@ static void cdcz_chunking_phase_one_avx2_gear(
 	std::vector<uint64_t>& cutpoints
 ) {
 	static constexpr uint32_t LANE_COUNT = 8;
-	std::array<std::vector<CutPointCandidate>, LANE_COUNT> lane_results{};
+	std::array<LaneCandidateResults, LANE_COUNT> lane_results{};
 	std::array<bool, LANE_COUNT> lane_achieved_chunk_invariance{};
 	lane_achieved_chunk_invariance.fill(false);
 	lane_achieved_chunk_invariance[0] = true;
@@ -714,9 +874,9 @@ static void cdcz_chunking_phase_one_avx2_gear(
 
 	const auto consume_lane_results = [&]() {
 		for (auto& lane_result : lane_results) {
-			for (const auto& candidate : lane_result) {
+			lane_result.for_each([&](const CutPointCandidate& candidate) {
 				if (candidate.offset <= prev_cut_offset) {
-					continue;
+					return;
 				}
 
 				while (candidate.offset - prev_cut_offset >= max_block_size) {
@@ -745,8 +905,8 @@ static void cdcz_chunking_phase_one_avx2_gear(
 					cutpoints.emplace_back(prev_cut_offset);
 				}
 
-			}
-			lane_result.clear();
+			});
+			lane_result.clear_and_release();
 		}
 	};
 
@@ -760,8 +920,10 @@ static void cdcz_chunking_phase_one_avx2_gear(
 
 		const uint64_t expected_candidates_per_lane =
 			((bytes_per_lane + avg_block_size - 1) / avg_block_size) + 2;
-		for (auto& lane_result : lane_results) {
-			lane_result.reserve(expected_candidates_per_lane);
+		for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
+			lane_results[lane_i].reset(
+				file_data_offset + lane_i * bytes_per_lane_without_overlap,
+				bytes_per_lane, expected_candidates_per_lane);
 		}
 
 		__m256i vindex = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
@@ -968,6 +1130,10 @@ static void cdcz_chunking_phase_one_avx2_gear(
 		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		file_data_offset++;
 	}
+	lane_results[LANE_COUNT - 1].reset(file_data_offset,
+		file_size - file_data_offset,
+		((file_size - file_data_offset + avg_block_size - 1) /
+			avg_block_size) + 2);
 	while (file_data_offset < file_size) {
 		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		if (!(pattern & easy_mask)) {
@@ -1010,7 +1176,7 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 	std::vector<uint64_t>& cutpoints
 ) {
 	static constexpr uint32_t LANE_COUNT = 8;
-	std::array<std::vector<CutPointCandidate>, LANE_COUNT> lane_results{};
+	std::array<LaneCandidateResults, LANE_COUNT> lane_results{};
 	std::array<bool, LANE_COUNT> lane_achieved_chunk_invariance{};
 	lane_achieved_chunk_invariance.fill(false);
 	lane_achieved_chunk_invariance[0] = true;
@@ -1030,9 +1196,9 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 
 	const auto consume_lane_results = [&]() {
 		for (auto& lane_result : lane_results) {
-			for (const auto& candidate : lane_result) {
+			lane_result.for_each([&](const CutPointCandidate& candidate) {
 				if (candidate.offset <= prev_cut_offset) {
-					continue;
+					return;
 				}
 
 				while (candidate.offset - prev_cut_offset >= max_block_size) {
@@ -1060,8 +1226,8 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 					prev_cut_offset = candidate.offset;
 					cutpoints.emplace_back(prev_cut_offset);
 				}
-			}
-			lane_result.clear();
+			});
+			lane_result.clear_and_release();
 		}
 	};
 
@@ -1075,8 +1241,10 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 
 		const uint64_t expected_candidates_per_lane =
 			((bytes_per_lane + avg_block_size - 1) / avg_block_size) + 2;
-		for (auto& lane_result : lane_results) {
-			lane_result.reserve(expected_candidates_per_lane);
+		for (uint32_t lane_i = 0; lane_i < LANE_COUNT; lane_i++) {
+			lane_results[lane_i].reset(
+				file_data_offset + lane_i * bytes_per_lane_without_overlap,
+				bytes_per_lane, expected_candidates_per_lane);
 		}
 
 		__m256i vindex = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
@@ -1321,6 +1489,10 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		file_data_offset++;
 	}
+	lane_results[LANE_COUNT - 1].reset(file_data_offset,
+		file_size - file_data_offset,
+		((file_size - file_data_offset + avg_block_size - 1) /
+			avg_block_size) + 2);
 	while (file_data_offset < file_size) {
 		pattern = (pattern << 1) + gear_common::table_32[file_data[file_data_offset]];
 		if (!(pattern & easy_mask)) {
