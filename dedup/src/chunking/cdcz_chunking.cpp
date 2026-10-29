@@ -598,7 +598,7 @@ static void cdcz_chunking_phase_one_avx512_gear_impl(
 
 				uint32_t candidates_easy_bits = easy_bitmap_words[lane_i];
 				while (candidates_easy_bits != 0) {
-					const uint32_t bit = _tzcnt_u32(candidates_easy_bits);
+					const uint32_t bit = trailing_zeros_u32(candidates_easy_bits);
 					candidates_easy_bits &= candidates_easy_bits - 1;
 					const uint64_t candidate_relative_pos =
 						static_cast<uint64_t>(current_lane_positions[lane_i]) + bit;
@@ -1033,7 +1033,7 @@ static void cdcz_chunking_phase_one_avx2_gear(
 				{
 					uint32_t candidates_easy_bits = easy_bitmap_words[lane_i];
 					while (candidates_easy_bits != 0) {
-						const uint32_t bit = _tzcnt_u32(candidates_easy_bits);
+						const uint32_t bit = trailing_zeros_u32(candidates_easy_bits);
 						candidates_easy_bits &= candidates_easy_bits - 1;
 						const uint64_t candidate_relative_pos =
 							static_cast<uint64_t>(current_lane_positions[lane_i]) + bit;
@@ -1405,7 +1405,7 @@ static void cdcz_chunking_phase_one_avx2_gear_scheduled_impl(
 
 				uint32_t candidates_easy_bits = easy_bitmap_words[lane_i];
 				while (candidates_easy_bits != 0) {
-					const uint32_t bit = _tzcnt_u32(candidates_easy_bits);
+					const uint32_t bit = trailing_zeros_u32(candidates_easy_bits);
 					candidates_easy_bits &= candidates_easy_bits - 1;
 					const uint64_t candidate_relative_pos =
 						static_cast<uint64_t>(current_lane_positions[lane_i]) + bit;

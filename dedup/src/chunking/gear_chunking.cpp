@@ -546,7 +546,7 @@ static void sscdc_chunking_phase_one_avx2_gear(uint32_t mask, uint64_t min_block
 						_mm256_movemask_ps(_mm256_castsi256_ps(lane_cutpoint_mask))
 					);
 					while (candidate_lanes != 0) {
-						const uint32_t lane_i = _tzcnt_u32(candidate_lanes);
+						const uint32_t lane_i = trailing_zeros_u32(candidate_lanes);
 						const uint64_t candidate_pos = file_data_offset
 							+ lane_i * bytes_per_lane_without_overlap
 							+ gather_i * sizeof(int32_t)
