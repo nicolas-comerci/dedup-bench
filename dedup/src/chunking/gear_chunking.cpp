@@ -245,7 +245,9 @@ static void sscdc_chunking_phase_one_avx512_gear(uint32_t mask, uint64_t min_blo
 }
 #undef doGearAvx512
 
-static inline void gather_gear_entries_avx512(
+// The SIMD kernel helpers and per-batch lambdas below are always inlined:
+// they run once per vector in every kernel's scan loop.
+static ALWAYS_INLINE void gather_gear_entries_avx512(
 		__m512i cbytes,
 		__m512i byte_mask,
 		__m512i& tentry0,
@@ -263,11 +265,11 @@ static inline void gather_gear_entries_avx512(
 	tentry3 = _mm512_i32gather_epi32(idx3, gear_common::table_32, 4);
 }
 
-static inline void roll_gear_avx512(__m512i& hash, __m512i tentry) {
+static ALWAYS_INLINE void roll_gear_avx512(__m512i& hash, __m512i tentry) {
 	hash = _mm512_add_epi32(_mm512_slli_epi32(hash, 1), tentry);
 }
 
-static inline void record_cutpoints_avx512(
+static ALWAYS_INLINE void record_cutpoints_avx512(
 		__m512i hash,
 		__m512i break_mark,
 		__m512i& cutpoint_bitmap_vmask) {
@@ -415,7 +417,7 @@ static void sscdc_chunking_phase_one_avx512_gear_with_gather_scheduling(uint32_t
 					__m256i tentry = _mm256_i32gather_epi32(reinterpret_cast<const int*>(gear_common::table_32), idx, 4);\
 					hash = _mm256_add_epi32(hash, tentry);}
 
-static inline void gather_gear_entries_avx2(
+static ALWAYS_INLINE void gather_gear_entries_avx2(
 		__m256i cbytes,
 		__m256i byte_mask,
 		__m256i& tentry0,
@@ -433,11 +435,11 @@ static inline void gather_gear_entries_avx2(
 	tentry3 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(gear_common::table_32), idx3, 4);
 }
 
-static inline void roll_gear_avx2(__m256i& hash, __m256i tentry) {
+static ALWAYS_INLINE void roll_gear_avx2(__m256i& hash, __m256i tentry) {
 	hash = _mm256_add_epi32(_mm256_slli_epi32(hash, 1), tentry);
 }
 
-static inline void record_cutpoints_avx2(
+static ALWAYS_INLINE void record_cutpoints_avx2(
 		__m256i hash,
 		__m256i break_mark,
 		__m256i zero_vec,
@@ -454,7 +456,7 @@ static inline void record_cutpoints_avx2(
 	);
 }
 
-static inline void load_and_transpose_8x8_epi32_avx2(
+static ALWAYS_INLINE void load_and_transpose_8x8_epi32_avx2(
 		const unsigned char* RESTRICT file_data,
 		uint64_t bytes_per_lane,
 		__m256i (&columns)[8]) {
@@ -816,7 +818,7 @@ enum class SSCDC64Avx2InputMode {
 	LOAD_TRANSPOSE,
 };
 
-static inline void gather_gear64_entries_avx2(
+static ALWAYS_INLINE void gather_gear64_entries_avx2(
 		__m128i cbytes,
 		__m128i byte_mask,
 		__m256i (&tentries)[4]) {
@@ -831,7 +833,7 @@ static inline void gather_gear64_entries_avx2(
 	tentries[3] = _mm256_i32gather_epi64(table, idx3, 8);
 }
 
-static inline void load_and_transpose_4x8_epi32_avx2(
+static ALWAYS_INLINE void load_and_transpose_4x8_epi32_avx2(
 		const unsigned char* RESTRICT file_data,
 		uint64_t bytes_per_lane,
 		__m128i (&columns)[8]) {
@@ -863,7 +865,7 @@ static inline void load_and_transpose_4x8_epi32_avx2(
 	columns[7] = _mm_castps_si128(high3);
 }
 
-static inline void record_cutpoints64_avx2(
+static ALWAYS_INLINE void record_cutpoints64_avx2(
 		__m256i hash,
 		__m256i break_mark,
 		__m256i high_bitmap_bit,
@@ -879,7 +881,7 @@ static inline void record_cutpoints64_avx2(
 	);
 }
 
-static inline void store_cutpoint_words64_avx2(
+static ALWAYS_INLINE void store_cutpoint_words64_avx2(
 		__m256i bitmap_words,
 		uint64_t bitmap_batch_offset,
 		uint64_t bitmap_bytes_per_lane,
@@ -927,7 +929,7 @@ static void sscdc_chunking_phase_one_avx2_gear64(
 		);
 		__m256i hash = _mm256_setzero_si256();
 
-		auto load_cbytes = [&](uint64_t batch_offset, __m128i (&cbytes)[DWORDS_PER_BITMAP_WORD]) {
+		auto load_cbytes = [&](uint64_t batch_offset, __m128i (&cbytes)[DWORDS_PER_BITMAP_WORD]) ALWAYS_INLINE_LAMBDA {
 			if constexpr (InputMode == SSCDC64Avx2InputMode::LOAD_TRANSPOSE) {
 				load_and_transpose_4x8_epi32_avx2(
 					file_data + file_data_offset + batch_offset,
@@ -945,7 +947,7 @@ static void sscdc_chunking_phase_one_avx2_gear64(
 			}
 		};
 
-		auto process_batch = [&](uint64_t batch_offset, auto record_tag) {
+		auto process_batch = [&](uint64_t batch_offset, auto record_tag) ALWAYS_INLINE_LAMBDA {
 			constexpr bool RECORD_CUTPOINTS = decltype(record_tag)::value;
 			__m128i cbytes[DWORDS_PER_BITMAP_WORD]{};
 			load_cbytes(batch_offset, cbytes);
@@ -1025,7 +1027,7 @@ static void sscdc_chunking_phase_one_avx2_gear64(
 #endif
 
 #if defined(__AVX512F__)
-static inline void load_and_transpose_16x8_epi32_avx512(
+static ALWAYS_INLINE void load_and_transpose_16x8_epi32_avx512(
 		const unsigned char* RESTRICT file_data,
 		uint64_t bytes_per_lane,
 		__m512i (&columns)[8]) {
@@ -1224,7 +1226,7 @@ enum class SSCDC64Avx512InputMode {
 	LOAD_TRANSPOSE,
 };
 
-static inline void load_and_transpose_8x4_epi64_avx512(
+static ALWAYS_INLINE void load_and_transpose_8x4_epi64_avx512(
 		const unsigned char* RESTRICT file_data,
 		uint64_t bytes_per_lane,
 		__m512i (&columns)[4]) {
@@ -1264,7 +1266,7 @@ static inline void load_and_transpose_8x4_epi64_avx512(
 	columns[3] = _mm512_permutex2var_epi64(row_groups4[1], column_high_indices, row_groups4[3]);
 }
 
-static inline void gather_gear64_entries_avx512(
+static ALWAYS_INLINE void gather_gear64_entries_avx512(
 		__m512i cbytes,
 		__m512i byte_mask,
 		__m512i (&tentries)[8]) {
@@ -1275,7 +1277,7 @@ static inline void gather_gear64_entries_avx512(
 	}
 }
 
-static inline void record_cutpoints64_avx512(
+static ALWAYS_INLINE void record_cutpoints64_avx512(
 		__m512i hash,
 		__m512i break_mark,
 		__m512i high_bitmap_bit,
@@ -1288,7 +1290,7 @@ static inline void record_cutpoints64_avx512(
 	);
 }
 
-static inline void store_cutpoint_words64_avx512(
+static ALWAYS_INLINE void store_cutpoint_words64_avx512(
 		__m512i bitmap_words,
 		uint64_t bitmap_batch_offset,
 		uint64_t bitmap_bytes_per_lane,
@@ -1338,7 +1340,7 @@ static void sscdc_chunking_phase_one_avx512_gear64(
 		);
 		__m512i hash = _mm512_setzero_si512();
 
-		auto load_cbytes = [&](uint64_t batch_offset, __m512i (&cbytes)[QWORDS_PER_BITMAP_WORD]) {
+		auto load_cbytes = [&](uint64_t batch_offset, __m512i (&cbytes)[QWORDS_PER_BITMAP_WORD]) ALWAYS_INLINE_LAMBDA {
 			if constexpr (InputMode == SSCDC64Avx512InputMode::LOAD_TRANSPOSE) {
 				load_and_transpose_8x4_epi64_avx512(
 					file_data + file_data_offset + batch_offset,
@@ -1356,7 +1358,7 @@ static void sscdc_chunking_phase_one_avx512_gear64(
 			}
 		};
 
-		auto process_batch = [&](uint64_t batch_offset, auto record_tag) {
+		auto process_batch = [&](uint64_t batch_offset, auto record_tag) ALWAYS_INLINE_LAMBDA {
 			constexpr bool RECORD_CUTPOINTS = decltype(record_tag)::value;
 			__m512i cbytes[QWORDS_PER_BITMAP_WORD]{};
 			load_cbytes(batch_offset, cbytes);

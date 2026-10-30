@@ -22,6 +22,23 @@
     #define RESTRICT
 #endif
 
+// Inlines a hot-loop helper regardless of the compiler's size heuristics,
+// which otherwise depend on how much other code ends up in the caller.
+#if defined(_MSC_VER)
+    #define ALWAYS_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+    #define ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+    #define ALWAYS_INLINE inline
+#endif
+
+// Same for a lambda; goes after its parameter list.
+#if defined(__GNUC__) || defined(__clang__)
+    #define ALWAYS_INLINE_LAMBDA __attribute__((always_inline))
+#else
+    #define ALWAYS_INLINE_LAMBDA
+#endif
+
 // Number of trailing zero bits of value, which must be nonzero. tzcnt needs
 // BMI (-mbmi); without it, bsf-based alternatives give the same result for
 // nonzero values.

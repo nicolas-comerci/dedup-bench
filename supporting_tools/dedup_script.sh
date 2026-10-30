@@ -89,6 +89,7 @@ rm -rf "$hashes_dir"
 mkdir -p "$hashes_dir"
 echo "Dataset path: $dataset" > results.txt
 
+run_failed=false
 for config_path in "${config_files[@]}"; do
     config_file=${config_path##*/}
     filename=${config_file%.conf}
@@ -105,18 +106,26 @@ for config_path in "${config_files[@]}"; do
 
     if ! run_output=$(./dedup.exe "$dataset" "$config_path"); then
         echo "Error: dedup.exe failed for $config_file" >&2
-        exit 1
+        run_failed=true
+        continue
     fi
     printf '%s\n' "$run_output" | sed -n '/^Avg/,$p' >> results.txt
 
     if [[ ! -f $output_file ]]; then
         echo "Error: expected hash output was not created: $output_file" >&2
-        exit 1
+        run_failed=true
+        continue
     fi
     if ! ./measure-dedup.exe "$output_file" >> results.txt; then
         echo "Error: measure-dedup.exe failed for $config_file" >&2
-        exit 1
+        run_failed=true
+        continue
     fi
 done
 
 $silent || echo "Finished. Results are stored in $script_dir/results.txt"
+
+if $run_failed; then
+    exit 1
+fi
+exit 0

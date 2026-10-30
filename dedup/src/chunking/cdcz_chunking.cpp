@@ -355,7 +355,9 @@ static uint64_t find_supercdc_backup_cut(
 					__m512i tentry = _mm512_i32gather_epi32(idx, gear_common::table_32, 4);\
 					hash = _mm512_add_epi32(hash, tentry);}
 
-static inline void load_and_transpose_16x8_epi32_avx512(
+// The SIMD kernel helpers and per-hash lambda below are always inlined:
+// they run once per vector in every kernel's scan loop.
+static ALWAYS_INLINE void load_and_transpose_16x8_epi32_avx512(
 	const unsigned char* RESTRICT file_data,
 	const uint32_t (&lane_positions)[16],
 	const uint32_t (&lane_end_positions)[16],
@@ -486,7 +488,7 @@ static void cdcz_chunking_phase_one_avx512_gear_impl(
 		while (lanes_at_end != static_cast<__mmask16>(0xffff)) {
 			const __mmask16 active_lanes_mask = static_cast<__mmask16>(~lanes_at_end);
 			const __m512i candidate_high_bit_vec = _mm512_maskz_mov_epi32(active_lanes_mask, high_bit_vec);
-			const auto record_candidate_masks = [&](const __m512i current_hash) {
+			const auto record_candidate_masks = [&](const __m512i current_hash) ALWAYS_INLINE_LAMBDA {
 					const __mmask16 lane_easy_mask = static_cast<__mmask16>(
 						_mm512_testn_epi32_mask(current_hash, mm_break_mark_easy) & active_lanes_mask);
 					candidates_easy_vmask = _mm512_srli_epi32(candidates_easy_vmask, 1);
@@ -776,7 +778,7 @@ static void cdcz_chunking_phase_one_avx512_gear_with_gather_scheduling(
 					__m256i tentry = _mm256_i32gather_epi32(reinterpret_cast<const int*>(gear_common::table_32), idx, 4);\
 					hash = _mm256_add_epi32(hash, tentry);}
 
-static inline void gather_gear_entries_avx2(
+static ALWAYS_INLINE void gather_gear_entries_avx2(
 		__m256i cbytes,
 		__m256i byte_mask,
 		__m256i& tentry0,
@@ -794,11 +796,11 @@ static inline void gather_gear_entries_avx2(
 	tentry3 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(gear_common::table_32), idx3, 4);
 }
 
-static inline void roll_gear_avx2(__m256i& hash, __m256i tentry) {
+static ALWAYS_INLINE void roll_gear_avx2(__m256i& hash, __m256i tentry) {
 	hash = _mm256_add_epi32(_mm256_slli_epi32(hash, 1), tentry);
 }
 
-static inline void load_and_transpose_8x8_epi32_avx2(
+static ALWAYS_INLINE void load_and_transpose_8x8_epi32_avx2(
 		const unsigned char* RESTRICT file_data,
 		const uint32_t (&lane_positions)[8],
 		const uint32_t (&lane_end_positions)[8],
@@ -1554,7 +1556,7 @@ static void cdcz_chunking_phase_one_avx2_gear_with_load_transpose(
 #endif
 
 #if defined(__AVX512F__)
-static inline void load_and_transpose_16x8_epi32_avx512(
+static ALWAYS_INLINE void load_and_transpose_16x8_epi32_avx512(
 		const unsigned char* RESTRICT file_data,
 		const uint32_t (&lane_positions)[16],
 		const uint32_t (&lane_end_positions)[16],
