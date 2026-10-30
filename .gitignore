@@ -44,3 +44,6 @@ build/random_dataset/
 build/hashes_*
 .vs/
 .idea/
+*.zstd
+*.xz
+*.pcf

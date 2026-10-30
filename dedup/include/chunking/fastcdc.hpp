@@ -1,6 +1,8 @@
 #ifndef _FastCDC_CHUNKING_
 #define _FastCDC_CHUNKING_
 
+#include <array>
+
 #include "chunking_common.hpp"
 #include "config.hpp"
 
@@ -20,6 +22,11 @@ class FastCDC : public virtual Chunking_Technique {
 
     uint64_t small_mask;
     uint64_t large_mask;
+
+    // Rolling two bytes each time: Gear tables shifted left by one bit.
+    bool roll_two_bytes;
+    alignas(64) std::array<uint32_t, 256> gear_ls_32;
+    alignas(64) std::array<uint64_t, 256> gear_ls_64;
 
     /**
      * @brief finds the next cut point in an array of bytes

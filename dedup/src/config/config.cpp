@@ -352,6 +352,10 @@ static bool get_optional_bool(const Parser& parser, const char* property,
                       + " option must be either 'true' or 'false'");
 }
 
+bool Config::get_fastcdc_roll_two_bytes() const {
+    return get_optional_bool(parser, FASTCDC_ROLL_TWO_BYTES, true);
+}
+
 uint64_t Config::get_ram_avg_block_size() const {
     try {
         std::string value = parser.get_property(RAM_AVG_BLOCK_SIZE);

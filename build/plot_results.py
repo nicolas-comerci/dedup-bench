@@ -16,6 +16,7 @@ rename_dict = { "aemin":"AE-Min",
                 "aemax":"AE-Max",
                 "crc32":"CRC32",
                 "fastcdc":"FastCDC",
+                "fastcdc-roll2":"FastCDC-Roll2",
                 "gear":"Gear",
                 "maxp":"MAXP",
                 "rabins":"Rabin",
@@ -37,7 +38,7 @@ rename_dict = { "aemin":"AE-Min",
 }
 
 preferred_order = [
-    "CRC32", "FastCDC", "Gear", "Rabin", "TTTD",
+    "CRC32", "FastCDC", "FastCDC-Roll2", "Gear", "Rabin", "TTTD",
     "AE-Max", "VAEMax-128", "VAEMax-256", "VAEMax-512",
     "AE-Min", "VAEMin-128", "VAEMin-256", "VAEMin-512",
     "MAXP", "VMAXP-128", "VMAXP-256", "VMAXP-512",

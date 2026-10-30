@@ -28,6 +28,7 @@
 #define FASTCDC_AVG_BLOCK_SIZE "fastcdc_avg_block_size"
 #define FASTCDC_NORMALIZATION_LEVEL "fastcdc_normalization_level"
 #define FASTCDC_DISABLE_NORMALIZATION "fastcdc_disable_normalization"
+#define FASTCDC_ROLL_TWO_BYTES "fastcdc_roll_two_bytes"
 #define RAM_AVG_BLOCK_SIZE "ram_avg_block_size"
 #define RAM_MAX_BLOCK_SIZE "ram_max_block_size"
 #define CRC_MIN_BLOCK_SIZE "crc_min_block_size"
@@ -265,6 +266,14 @@ class Config {
      * @return disable normalization state
      */
     bool get_fastcdc_disable_normalization() const;
+
+    /**
+     * @brief Roll the FastCDC fingerprint two bytes at a time. Defaults to
+     * true when the key is missing.
+     *
+     * @return roll two bytes state
+     */
+    bool get_fastcdc_roll_two_bytes() const;
 
     /**
      * @brief Get the desired avg size of the block when using RAM chunking
