@@ -124,8 +124,11 @@ uint64_t SuperCDC::find_cutpoint(char* data, uint64_t len) {
         }
     }
 
-    // Reached max_block_size, use SuperCDC backup if it exists, else cut with length=max_block_size
-    return backup_i > 0 ? backup_i : length; //Double check that this is safe to return length here
+    // No cut before length. The backup is SuperCDC's fallback for a chunk that
+    // reached max_block_size; when the input ends within max_block_size bytes
+    // the chunk ends with the input instead.
+    const bool reached_max = !input_ends_in_buffer || len > max_block_size;
+    return backup_i > 0 && reached_max ? backup_i : length;
 }
 
 SuperCDC::~SuperCDC() {}

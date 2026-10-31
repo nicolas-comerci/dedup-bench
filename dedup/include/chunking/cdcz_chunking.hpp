@@ -37,8 +37,6 @@ class Cdcz_Chunking : public virtual Chunking_Technique {
      */
     uint64_t find_cutpoint(char* buff, uint64_t size) override;
 
-    uint64_t find_cutpoint_serial(char* buff, uint64_t size);
-
 
    public:
     /**

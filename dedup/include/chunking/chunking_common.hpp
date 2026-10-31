@@ -49,7 +49,12 @@ class Chunking_Technique{
          * @return: size of the chunk
          */
         int64_t create_chunk(std::vector<std::string>& hashes, char* data, uint64_t buffer_end);
-        
+
+        // Whether the buffer passed to find_cutpoint holds the end of the
+        // input, set by chunk_stream before each call. Lets a chunker tell a
+        // short final buffer apart from a full one.
+        bool input_ends_in_buffer = false;
+
     public:
         std::string technique_name;
         std::unique_ptr<Hashing_Technique> hash_method;

@@ -289,7 +289,6 @@ private:
 	bool dense_ = false;
 };
 
-#if defined(__AVX2__) || defined(__AVX512F__) || !defined(NDEBUG)
 struct CdczMasks {
 	uint32_t hard;
 	uint32_t easy;
@@ -303,7 +302,144 @@ static CdczMasks make_level_one_masks(uint32_t high_average_mask, uint64_t avg_b
 	const uint32_t easy_mask = average_mask >> 1;
 	return {hard_mask, easy_mask, easy_mask >> 1};
 }
-#endif
+
+// Bytes per group of the serial scan's group-end judgment, as in PrefixSum's
+// serial scan (prefix_sum_chunking.cpp).
+constexpr int group_bytes = 16;
+static_assert(group_bytes <= gear_common::shifted_table_set::shift_count,
+	"the shifted Gear tables must cover every group position");
+
+// A scan position and the fingerprint of the byte before it.
+struct scan_state {
+	uint64_t pos;
+	uint32_t pattern;
+};
+
+// Whether group-end judgment can judge every mask of a chunk: it shifts masks
+// left by up to group_bytes - 1 within the 32-bit fingerprint, and the hard
+// mask is the widest (at most 17 bits).
+static bool group_end_fits(const CdczMasks& masks) {
+	return masks.hard <= (0xffffffffu >> (group_bytes - 1));
+}
+
+// Scans from state.pos to end and returns the state at the first position
+// whose fingerprint has no bit of mask set (pattern at its fingerprint), or
+// with pos at end (pattern at the fingerprint of end - 1) if there is none.
+//
+// With group_end, group-end judgment rolls group_bytes bytes per iteration:
+// the running value starts at pattern << group_bytes and adds the Gear entry
+// of byte k shifted left by group_bytes - 1 - k, so after byte k it is that
+// position's fingerprint shifted left by group_bytes - 1 - k, and it is judged
+// against mask shifted the same way. This extends FastCDC's rolling two bytes
+// each time (Xia et al., TPDS 2020, Section 3.7) to whole groups. The caller
+// enables it only when every mask of the chunk fits in 32 bits shifted.
+//
+// Kept out of line: inlined into the chunk loop, GCC hoists the shifted masks
+// of all three scans of a chunk out of it and tests most of them from the
+// stack.
+static NOINLINE scan_state scan_until(const unsigned char* data,
+		scan_state state, uint64_t end, uint32_t mask, bool group_end) {
+	uint64_t pos = state.pos;
+	uint32_t pattern = state.pattern;
+	if (group_end) {
+		// Built as a chain of shifts: written as independent shifts, GCC
+		// vectorizes them under AVX flags and the loop then moves each mask
+		// out of a vector register.
+		uint32_t masks[group_bytes];
+		masks[group_bytes - 1] = mask;
+		for (int k = group_bytes - 2; k >= 0; --k) {
+			masks[k] = masks[k + 1] << 1;
+		}
+		for (; pos + group_bytes <= end; pos += group_bytes) {
+			uint32_t value = pattern << group_bytes;
+#pragma GCC unroll 16
+			for (int k = 0; k < group_bytes; ++k) {
+				value += gear_common::table_32_shifted
+					.entries[group_bytes - 1 - k][data[pos + k]];
+				// Cuts are rare; the hint keeps the no-cut path in line.
+				if (__builtin_expect((value & masks[k]) == 0, 0)) {
+					// Exact in the low 17 + k bits, which covers every mask
+					// of the chunk.
+					return {pos + k, value >> (group_bytes - 1 - k)};
+				}
+			}
+			pattern = value;
+		}
+	}
+	for (; pos < end; pos++) {
+		pattern = (pattern << 1) + gear_common::table_32[data[pos]];
+		if (!(pattern & mask)) {
+			return {pos, pattern};
+		}
+	}
+	return {pos, pattern};
+}
+
+// CDCZ's cut for the chunk starting at data[start], with data available up to
+// end: the first hard-mask match from start + min to start + avg, else the
+// first easy-mask match before start + max. Without one, a chunk that reaches
+// max (more than max bytes remain, or data_ends is false) is cut at the first
+// backup-mask match after start + avg, else at start + max (SuperCDC's
+// fallback); when the data ends within max bytes the chunk ends with it. Each
+// fingerprint covers the 32 bytes before its position, as in the SIMD lanes.
+// Always inlined so the masks stay in registers instead of being reloaded from
+// stack arguments for every byte.
+static ALWAYS_INLINE uint64_t cdcz_serial_cut(const unsigned char* data, uint64_t start,
+		uint64_t end, const CdczMasks& masks, uint64_t min_block_size,
+		uint64_t avg_block_size, uint64_t max_block_size, bool data_ends) {
+	if (end - start <= min_block_size) {
+		return end;
+	}
+	const uint32_t hard_mask = masks.hard;
+	const uint32_t easy_mask = masks.easy;
+	const uint32_t backup_mask = masks.backup;
+	const bool group_end = group_end_fits(masks);
+	const uint64_t limit = std::min(end, start + max_block_size);
+	const uint64_t first_phase = std::min(limit, start + avg_block_size);
+	scan_state state{start + min_block_size, 0};
+	for (uint64_t i = state.pos >= GEAR_HASHLEN ? state.pos - GEAR_HASHLEN : 0;
+			i < state.pos; i++) {
+		state.pattern = (state.pattern << 1) + gear_common::table_32[data[i]];
+	}
+	state = scan_until(data, state, first_phase, hard_mask, group_end);
+	if (state.pos < first_phase) {
+		return state.pos;
+	}
+	// Up to the first backup-mask match, then the easy mask only, as in
+	// SuperCDC: an easy-mask match is also a backup-mask match.
+	state = scan_until(data, state, limit, backup_mask, group_end);
+	if (state.pos == limit || !(state.pattern & easy_mask)) {
+		return state.pos;
+	}
+	const uint64_t backup = state.pos;
+	++state.pos;
+	state = scan_until(data, state, limit, easy_mask, group_end);
+	if (state.pos < limit) {
+		return state.pos;
+	}
+	const bool reached_max = !data_ends || end - start > max_block_size;
+	return reached_max ? backup : limit;
+}
+
+// Serial phase one: the cuts of the SIMD versions, chunk by chunk, with a
+// final cut at the end of the data.
+static void cdcz_chunking_phase_one_serial(
+	uint32_t mask,
+	uint64_t avg_block_size,
+	uint64_t min_block_size,
+	uint64_t max_block_size,
+	const unsigned char* RESTRICT file_data,
+	uint64_t file_size,
+	std::vector<uint64_t>& cutpoints
+) {
+	const CdczMasks masks = make_level_one_masks(mask, avg_block_size);
+	uint64_t prev_cut_offset = 0;
+	while (prev_cut_offset < file_size) {
+		prev_cut_offset = cdcz_serial_cut(file_data, prev_cut_offset, file_size,
+			masks, min_block_size, avg_block_size, max_block_size, true);
+		cutpoints.emplace_back(prev_cut_offset);
+	}
+}
 
 static inline bool is_chunk_invariance_condition_satisfied(
   bool is_prev_candidate_hard, uint64_t dist_with_prev, CutPointCandidateType new_candidate_type,
@@ -1654,9 +1790,6 @@ static void cdcz_chunking_phase_one_avx512_gear_with_load_transpose(
 #endif
 
 std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
-	if (simd_mode == SIMD_Mode::NONE) {
-		return Chunking_Technique::chunk_file(file_path);
-	}
 	std::vector<std::string> hashes;
 	chunk_file(file_path, [&hashes](const std::string& hash) {
 		hashes.emplace_back(hash);
@@ -1666,19 +1799,15 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 
 uint64_t Cdcz_Chunking::chunk_file(
 		std::string file_path, const Chunk_Result_Consumer& consumer) {
-	if (simd_mode == SIMD_Mode::NONE) {
-		std::vector<std::string> hashes =
-			Chunking_Technique::chunk_file(file_path);
-		for (const auto& hash : hashes) {
-			consumer(hash);
-		}
-		return hashes.size();
-	}
-
 	using phase_one_function = void (*)(uint32_t, uint64_t, uint64_t, uint64_t, const unsigned char*, uint64_t, std::vector<uint64_t>&);
 	phase_one_function phase_one = nullptr;
 	uint32_t lane_count = 0;
 	switch (simd_mode) {
+		case SIMD_Mode::NONE: {
+			lane_count = 1;
+			phase_one = cdcz_chunking_phase_one_serial;
+			break;
+		}
 	#if defined(__AVX2__)
 		case SIMD_Mode::AVX256: {
 			lane_count = 8;
@@ -1855,26 +1984,11 @@ uint64_t Cdcz_Chunking::chunk_file(
 }
 
 uint64_t Cdcz_Chunking::find_cutpoint(char* data, uint64_t size) {
-	return find_cutpoint_serial(data, size);
-}
-
-uint64_t Cdcz_Chunking::find_cutpoint_serial(char* data, uint64_t size) {
-  uint32_t hash = 0;
-  uint64_t idx = min_block_size;
-  const uint32_t mask_32 = static_cast<uint32_t>(mask >> 32);
-
-  // If given data is lower than the minimum chunk size, return data length.
-  if (size <= min_block_size) {
-    return size;
-  }
-
-  while (idx < size && idx < max_block_size) {
-    hash = gear_common::roll(hash, static_cast<uint8_t>(data[idx]));
-    if (!(hash & mask_32)) {
-      return idx;
-    }
-    idx += 1;
-  }
-
-  return idx;
+	// CDCZ chunks whole files in chunk_file; this applies the same rules to a
+	// single buffer.
+	const CdczMasks masks = make_level_one_masks(
+		static_cast<uint32_t>(mask >> 32), avg_block_size);
+	return cdcz_serial_cut(reinterpret_cast<const unsigned char*>(data), 0,
+		size, masks, min_block_size, avg_block_size, max_block_size,
+		input_ends_in_buffer);
 }

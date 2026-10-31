@@ -227,12 +227,14 @@ void Chunking_Technique::chunk_stream(std::vector<std::string>& hashes,
         }
 
         buffer_end += bytes_to_read;
+        input_ends_in_buffer = bytes_left == bytes_to_read;
         chunk_size = create_chunk(hashes, buffer.get(), buffer_end);
         buffer_end -= chunk_size;
         memmove(buffer.get(), buffer.get() + chunk_size, buffer_end);
         bytes_left -= bytes_to_read;
     }
     // finalize
+    input_ends_in_buffer = true;
     while (buffer_end > 0) {
         chunk_size = create_chunk(hashes, buffer.get(), buffer_end);
         buffer_end -= chunk_size;

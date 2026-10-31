@@ -126,4 +126,14 @@ alignas(64) const uint64_t table_64[256] = {
         0xd31b4b03145f02fa
 };
 
+const shifted_table_set table_32_shifted = [] {
+    shifted_table_set tables{};
+    for (int shift = 0; shift < shifted_table_set::shift_count; ++shift) {
+        for (int byte = 0; byte < 256; ++byte) {
+            tables.entries[shift][byte] = table_32[byte] << shift;
+        }
+    }
+    return tables;
+}();
+
 }  // namespace gear_common

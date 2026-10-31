@@ -39,6 +39,16 @@
     #define ALWAYS_INLINE_LAMBDA
 #endif
 
+// Keeps a function out of line, so the values it computes from its arguments
+// stay local to each call instead of being hoisted into the caller's loop.
+#if defined(_MSC_VER)
+    #define NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    #define NOINLINE __attribute__((noinline))
+#else
+    #define NOINLINE
+#endif
+
 // Number of trailing zero bits of value, which must be nonzero. tzcnt needs
 // BMI (-mbmi); without it, bsf-based alternatives give the same result for
 // nonzero values.
