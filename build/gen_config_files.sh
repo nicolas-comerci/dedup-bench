@@ -91,7 +91,7 @@ mkdir -p config_${now}
 mkdir -p hashes_${now}
 for technique in "${TECHNIQUES[@]}"; do
   CONFIG_FILE="./config_${now}/${technique}_${AVG_SIZE}.conf"
-  OUTPUT_FILE="./hashes_${now}/${technique}_${AVG_SIZE}.out"
+  OUTPUT_FILE="${technique}_${AVG_SIZE}.out"
   {
     echo "chunking_algo = $technique"
     echo "hashing_algo = sha1"

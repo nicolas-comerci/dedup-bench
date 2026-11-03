@@ -96,6 +96,9 @@ for config_path in "${config_files[@]}"; do
     output_file=$(sed -n 's/^[[:space:]]*output_file[[:space:]]*=[[:space:]]*//p' "$config_path" | tail -n 1 | tr -d '\r')
     if [[ -z $output_file ]]; then
         output_file="./${hashes_dir}/${filename}.out"
+    elif [[ $output_file != */* && $output_file != *\\* ]]; then
+        # bare filename -> place under this run's hashes dir
+        output_file="./${hashes_dir}/${output_file}"
     fi
     mkdir -p "$(dirname "$output_file")"
 

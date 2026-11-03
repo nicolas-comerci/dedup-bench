@@ -154,7 +154,29 @@ int main(int argc, char* argv[]) {
         ChunkingTech chunking_technique = config.get_chunking_tech();
         HashingTech hashing_technique = config.get_hashing_tech();
         output_file = config.get_output_file();
-        
+
+        // If output_file is empty or a bare filename, place it under
+        // hashes_<config-suffix>/ derived from the config directory name so
+        // that configs can be copied across benchmark folders unchanged.
+        const bool bare = output_file.empty()
+            || (output_file.find('/') == std::string::npos
+                && output_file.find('\\') == std::string::npos);
+        if (bare) {
+            std::filesystem::path cfg{argv[2]};
+            const std::string parent = cfg.parent_path().filename().string();
+            const std::string prefix = "config_";
+            if (parent.rfind(prefix, 0) == 0) {
+                const std::string suffix = parent.substr(prefix.size());
+                const std::string name = output_file.empty()
+                    ? cfg.filename().replace_extension(".out").string()
+                    : output_file;
+                output_file = "hashes_" + suffix + "/" + name;
+            }
+        }
+        if (output_file.empty()) {
+            output_file = "hashes.out";
+        }
+
         std::unique_ptr<Chunking_Technique> chunk_method;
 
         // Set parameters for hashing technique and call relevant constructors

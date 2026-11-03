@@ -44,7 +44,7 @@ def generate_config_files(input_file, chunking_algo_value, buffer_size, suffix):
             f.write(f"chunking_algo={chunking_algo_value}\n")
             f.write("hashing_algo=xxhash128\n")
             f.write("simd_mode=none\n")
-            f.write(f"output_file=./hashes_{suffix}/config_{i+1}.out\n")
+            f.write(f"output_file=config_{i+1}.out\n")
             f.write(f"buffer_size={buffer_size}\n")
     
     print(f"\nGenerated {len(all_combinations)} configuration files in directory: {output_dir}")

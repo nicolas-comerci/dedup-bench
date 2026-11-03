@@ -167,7 +167,7 @@ std::string Config::get_output_file() const {
         return value;
     } catch (...) {
     }
-    return "hashes.out";
+    return "";
 }
 
 uint64_t Config::get_ae_avg_block_size() const {
