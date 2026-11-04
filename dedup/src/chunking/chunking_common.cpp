@@ -10,6 +10,7 @@
  */
 #include "chunking_common.hpp"
 #include "hashing_common.hpp"
+#include "memory_stream.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -241,4 +242,16 @@ void Chunking_Technique::chunk_stream(std::vector<std::string>& hashes,
         memmove(buffer.get(), buffer.get() + chunk_size, buffer_end);
     }
     return;
+}
+
+void Chunking_Technique::chunk_buffer(std::vector<std::string>& hashes,
+                                      const unsigned char* data, uint64_t size) {
+    if (size == 0) {
+        return;
+    }
+    // Non-owning seekable view over the caller's buffer, so we can reuse the
+    // exact chunk_stream() loop without copying the data.
+    MemoryInputStream view(reinterpret_cast<const char*>(data), size,
+                           MemoryInputStream::NonOwning{});
+    chunk_stream(hashes, view);
 }

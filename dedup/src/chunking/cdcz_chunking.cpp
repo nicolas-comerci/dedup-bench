@@ -32,9 +32,11 @@
 
 #include <immintrin.h>
 
+#include "aligned_alloc.hpp"
 #include "compiler_compat.hpp"
 #include "config_error.hpp"
 #include "gear_common.hpp"
+#include "memory_stream.hpp"
 
 extern bool disable_hashing;
 
@@ -91,38 +93,6 @@ static CdczWindowLayout make_cdcz_window_layout(
 	const uint64_t window_bytes =
 		(bytes_per_lane_without_overlap * lane_count) + GEAR_HASHLEN;
 	return {window_bytes, bytes_per_lane_without_overlap, bytes_per_lane};
-}
-
-inline void* portable_aligned_alloc(std::size_t alignment, std::size_t size) {
-	if (alignment == 0) {
-		return nullptr;
-	}
-	const std::size_t minimum_size = std::max(size, alignment);
-	if (minimum_size > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
-		return nullptr;
-	}
-	const std::size_t aligned_size = ((minimum_size + alignment - 1) / alignment) * alignment;
-#ifdef _WIN32
-	return _aligned_malloc(aligned_size, alignment);
-#elif defined(__APPLE__) || defined(__MACH__)
-	// macOS: posix_memalign is safest
-	void* ptr = nullptr;
-	if (posix_memalign(&ptr, alignment, aligned_size) != 0) {
-		return nullptr;
-	}
-	return ptr;
-#else
-	// Linux and others with C11 support
-	return std::aligned_alloc(alignment, aligned_size);
-#endif
-}
-
-inline void portable_aligned_free(void* ptr) {
-#ifdef _WIN32
-	_aligned_free(ptr);
-#else
-	std::free(ptr);
-#endif
 }
 
 enum CutPointCandidateType : uint8_t {
@@ -1799,6 +1769,32 @@ std::vector<std::string> Cdcz_Chunking::chunk_file(std::string file_path) {
 
 uint64_t Cdcz_Chunking::chunk_file(
 		std::string file_path, const Chunk_Result_Consumer& consumer) {
+	std::ifstream file_ptr;
+	file_ptr.open(file_path, std::ios::in | std::ios::binary);
+	if (!file_ptr.is_open()) {
+		throw std::runtime_error("Failed to open file: " + file_path);
+	}
+	return chunk_stream_impl(file_ptr, consumer);
+}
+
+void Cdcz_Chunking::chunk_buffer(std::vector<std::string>& hashes,
+                                  const unsigned char* data, uint64_t size) {
+	MemoryInputStream view(reinterpret_cast<const char*>(data), size,
+	                       MemoryInputStream::NonOwning{});
+	chunk_stream_impl(view, [&hashes](const std::string& hash) {
+		hashes.emplace_back(hash);
+	});
+}
+
+void Cdcz_Chunking::chunk_stream(std::vector<std::string>& hashes,
+                                 std::istream& stream) {
+	chunk_stream_impl(stream, [&hashes](const std::string& hash) {
+		hashes.emplace_back(hash);
+	});
+}
+
+uint64_t Cdcz_Chunking::chunk_stream_impl(std::istream& stream,
+                                          const Chunk_Result_Consumer& consumer) {
 	using phase_one_function = void (*)(uint32_t, uint64_t, uint64_t, uint64_t, const unsigned char*, uint64_t, std::vector<uint64_t>&);
 	phase_one_function phase_one = nullptr;
 	uint32_t lane_count = 0;
@@ -1848,18 +1844,7 @@ uint64_t Cdcz_Chunking::chunk_file(
 			exit(1);
 	}
 
-	std::ifstream file_ptr;
-	file_ptr.open(file_path, std::ios::in | std::ios::binary);
-	if (!file_ptr.is_open()) {
-		throw std::runtime_error("Failed to open file: " + file_path);
-	}
-
-	file_ptr.seekg(0, std::ios_base::end);
-	const std::streampos end_position = file_ptr.tellg();
-	if (end_position < 0) {
-		throw std::runtime_error("Failed to determine file size: " + file_path);
-	}
-	const uint64_t file_size = static_cast<uint64_t>(end_position);
+	const uint64_t file_size = get_file_size(&stream);
 	const CdczWindowLayout maximum_window =
 		make_cdcz_window_layout(CDCZ_WINDOW_SIZE, lane_count);
 	if (max_block_size >= maximum_window.window_bytes) {
@@ -1869,12 +1854,12 @@ uint64_t Cdcz_Chunking::chunk_file(
 	const uint64_t window_capacity =
 		std::min(file_size, maximum_window.window_bytes);
 
-	using aligned_buffer = std::unique_ptr<unsigned char, decltype(&portable_aligned_free)>;
+	using aligned_buffer = std::unique_ptr<unsigned char, decltype(&aligned_free_64)>;
 	aligned_buffer file_data_owner(
-		static_cast<unsigned char*>(portable_aligned_alloc(64, window_capacity)),
-		&portable_aligned_free
+		static_cast<unsigned char*>(aligned_alloc_64(window_capacity)),
+		&aligned_free_64
 	);
-	if (!file_data_owner) {
+	if (!file_data_owner && window_capacity != 0) {
 		printf("Error: allocate aligned file buffer failed, exit\n");
 		exit(2);
 	}
@@ -1898,13 +1883,13 @@ uint64_t Cdcz_Chunking::chunk_file(
 			std::min(window_capacity, bytes_remaining);
 		const bool final_window = bytes_in_window == bytes_remaining;
 
-		file_ptr.clear();
-		file_ptr.seekg(static_cast<std::streamoff>(global_offset),
+		stream.clear();
+		stream.seekg(static_cast<std::streamoff>(global_offset),
 			std::ios_base::beg);
-		if (!file_ptr || !read_exact(file_ptr,
+		if (!stream || !read_exact(stream,
 				reinterpret_cast<char*>(file_data), bytes_in_window)) {
 			throw std::runtime_error(
-				"Failed to read CDCZ processing window: " + file_path);
+				"Failed to read CDCZ processing window");
 		}
 
 		cutpoints.clear();

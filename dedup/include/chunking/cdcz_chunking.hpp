@@ -37,6 +37,13 @@ class Cdcz_Chunking : public virtual Chunking_Technique {
      */
     uint64_t find_cutpoint(char* buff, uint64_t size) override;
 
+    /**
+     * @brief Run the windowed SIMD (or serial) phase-one over a seekable
+     * stream, emitting each chunk hash through `consumer`.
+     */
+    uint64_t chunk_stream_impl(std::istream& stream,
+                               const Chunk_Result_Consumer& consumer);
+
 
    public:
     /**
@@ -60,6 +67,16 @@ class Cdcz_Chunking : public virtual Chunking_Technique {
 
     uint64_t chunk_file(
         std::string file_path, const Chunk_Result_Consumer& consumer) override;
+
+    /**
+     * @brief Chunk an already-materialized buffer using the windowed SIMD
+     * phase-one (no extra copy of the data).
+     */
+    void chunk_buffer(std::vector<std::string>& hashes,
+                      const unsigned char* data, uint64_t size) override;
+
+    void chunk_stream(std::vector<std::string>& hashes,
+                      std::istream& stream) override;
 };
 
 #endif

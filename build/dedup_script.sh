@@ -7,7 +7,7 @@ dataset=""
 silent=false
 
 display_help() {
-    echo "Usage: $0 -c <config-suffix> [OPTIONS] <DATASET_DIRECTORY>"
+    echo "Usage: $0 -c <config-suffix> [OPTIONS] <DATASET_DIR_OR_XZ_FILE>"
     echo "Options:"
     echo "  -c, --config SUFFIX  Use config_SUFFIX/ and hashes_SUFFIX/"
     echo "  -t SUFFIX            Backward-compatible alias for -c"
@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             if [[ -n $dataset ]]; then
-                echo "Error: only one dataset directory may be supplied." >&2
+                echo "Error: only one dataset (directory or .xz file) may be supplied." >&2
                 exit 1
             fi
             dataset=$1
@@ -50,16 +50,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z $config_suffix || -z $dataset ]]; then
-    echo "Error: both a config suffix and dataset directory are required." >&2
+    echo "Error: both a config suffix and a dataset (directory or .xz file) are required." >&2
     display_help >&2
     exit 1
 fi
 
-if [[ ! -d $dataset ]]; then
-    echo "Error: dataset directory not found: $dataset" >&2
+if [[ -d $dataset ]]; then
+    dataset=$(cd "$dataset" && pwd -P)
+elif [[ -f $dataset ]]; then
+    # A single dataset file, e.g. a .xz archive decompressed in memory.
+    dataset=$(cd "$(dirname "$dataset")" && pwd -P)/$(basename "$dataset")
+else
+    echo "Error: dataset not found (expected a directory or a .xz file): $dataset" >&2
     exit 1
 fi
-dataset=$(cd "$dataset" && pwd -P)
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$script_dir"

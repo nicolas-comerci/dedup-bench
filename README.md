@@ -74,7 +74,7 @@ run the usual commands:
   python3 plot_results.py results.txt
 ```
 
-`install.sh` installs the UCRT64 GCC, OpenSSL, xxHash, Python, and plotting
+`install.sh` installs the UCRT64 GCC, OpenSSL, xxHash, xz, Python, and plotting
 packages through `pacman`, then offers the same unaccelerated, AVX-256, and
 AVX-512 build choices as Linux. Bash and Make only orchestrate the workflow;
 `dedup.exe` and the measurement programs are native Windows/UCRT64 binaries.
@@ -184,10 +184,11 @@ We provide configuration files in `build/` for the experiments from our papers. 
      cd build/
      vim config.txt
    ```
-2. Run the dedup-bench binary directly. Note that the path to be passed is a **directory containing all the dataset files** and that the output is generated in a file `hash.out`. Throughput and avg chunk size are printed to stdout.
-   ```
-     ./dedup.exe <path_to_random_dataset_dir> config.txt
-   ```
+2. Run the dedup-bench binary directly. Note that the path to be passed is a **directory containing all the dataset files**, or a **single `.xz` file** which is decompressed into memory before chunking (useful for storing large datasets compressed on disk). The output is generated in a file `hash.out`. Throughput and avg chunk size are printed to stdout.
+    ```
+      ./dedup.exe <path_to_random_dataset_dir> config.txt
+      ./dedup.exe <path_to_dataset.xz> config.txt
+    ```
 3. Measure space savings. Note that space savings will be zero if the random dataset is used.
    ```
      ./measure-dedup.exe hash.out

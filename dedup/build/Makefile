@@ -29,7 +29,7 @@ ifneq ($(strip $(INCLUDE_PATH_OPENSSL)),)
 INCLUDE_FLAGS += -I ${INCLUDE_PATH_OPENSSL}
 endif
 
-LD_FLAGS = $(OPENSSL_LIBRARY_PATH) -lcrypto -lxxhash
+LD_FLAGS = $(OPENSSL_LIBRARY_PATH) -lcrypto -lxxhash -llzma
 
 SRC_PATH = ../src
 SRC_MAIN = $(wildcard $(SRC_PATH)/*.cpp)

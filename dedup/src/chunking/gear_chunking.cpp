@@ -29,6 +29,7 @@
 
 #include <immintrin.h>
 
+#include "aligned_alloc.hpp"
 #include "compiler_compat.hpp"
 #include "config_error.hpp"
 #include "gear_common.hpp"
@@ -77,38 +78,6 @@ static inline void doGear_serial(uint8_t c, uint32_t* x) {
 #endif
 #define HASHLEN 256
 #define GEAR_HASHLEN 32
-
-inline void* portable_aligned_alloc(std::size_t alignment, std::size_t size) {
-	if (alignment == 0) {
-		return nullptr;
-	}
-	const std::size_t minimum_size = std::max(size, alignment);
-	if (minimum_size > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
-		return nullptr;
-	}
-	const std::size_t aligned_size = ((minimum_size + alignment - 1) / alignment) * alignment;
-#ifdef _WIN32
-	return _aligned_malloc(aligned_size, alignment);
-#elif defined(__APPLE__) || defined(__MACH__)
-	// macOS: posix_memalign is safest
-	void* ptr = nullptr;
-	if (posix_memalign(&ptr, alignment, aligned_size) != 0) {
-		return nullptr;
-	}
-	return ptr;
-#else
-	// Linux and others with C11 support
-	return std::aligned_alloc(alignment, aligned_size);
-#endif
-}
-
-inline void portable_aligned_free(void* ptr) {
-#ifdef _WIN32
-	_aligned_free(ptr);
-#else
-	std::free(ptr);
-#endif
-}
 
 // Precondition: cutpoint_bitmap is allocated with at least (file_size / 8) (+1 if not divisible) bytes
 // Serial version of SS-CDC phase one to have a simpler, slower but correct implementation for reference
@@ -1648,6 +1617,48 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 		return Chunking_Technique::chunk_file(file_path);
 	}
 
+	std::ifstream file_ptr;
+	file_ptr.open(file_path, std::ios::in | std::ios::binary);
+	if (!file_ptr.is_open()) {
+		throw std::runtime_error("Failed to open file: " + file_path);
+	}
+
+	file_ptr.seekg(0, std::ios_base::end);
+	const std::streampos end_position = file_ptr.tellg();
+	if (end_position < 0) {
+		throw std::runtime_error("Failed to determine file size: " + file_path);
+	}
+	const uint64_t file_size = static_cast<uint64_t>(end_position);
+	file_ptr.seekg(0, std::ios_base::beg);
+	if (!file_ptr) {
+		throw std::runtime_error("Failed to seek file: " + file_path);
+	}
+
+	using aligned_buffer = std::unique_ptr<unsigned char, decltype(&aligned_free_64)>;
+	aligned_buffer file_data(
+		static_cast<unsigned char*>(aligned_alloc_64(file_size)),
+		&aligned_free_64
+	);
+	if (!file_data && file_size != 0) {
+		printf("Error: allocate aligned file buffer failed, exit\n");
+		exit(2);
+	}
+	if (!read_exact(file_ptr, reinterpret_cast<char*>(file_data.get()), file_size)) {
+		throw std::runtime_error("Failed to read complete file: " + file_path);
+	}
+
+	std::vector<std::string> hashes;
+	chunk_buffer(hashes, file_data.get(), file_size);
+	return hashes;
+}
+
+void Gear_Chunking::chunk_buffer(std::vector<std::string>& hashes,
+                                 const unsigned char* data, uint64_t size) {
+	if (simd_mode == SIMD_Mode::NONE) {
+		Chunking_Technique::chunk_buffer(hashes, data, size);
+		return;
+	}
+
 	using phase_one_function32 = void (*)(uint32_t, uint64_t, const unsigned char*, uint64_t, uint8_t*);
 	using phase_one_function64 = void (*)(uint64_t, uint64_t, const unsigned char*, uint64_t, uint8_t*);
 	phase_one_function32 phase_one32 = nullptr;
@@ -1696,71 +1707,41 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 			exit(1);
 	}
 
-	std::ifstream file_ptr;
-	file_ptr.open(file_path, std::ios::in | std::ios::binary);
-	if (!file_ptr.is_open()) {
-		throw std::runtime_error("Failed to open file: " + file_path);
-	}
+	file_size = size;
 
-	file_ptr.seekg(0, std::ios_base::end);
-	const std::streampos end_position = file_ptr.tellg();
-	if (end_position < 0) {
-		throw std::runtime_error("Failed to determine file size: " + file_path);
-	}
-	file_size = static_cast<uint64_t>(end_position);
-	file_ptr.seekg(0, std::ios_base::beg);
-	if (!file_ptr) {
-		throw std::runtime_error("Failed to seek file: " + file_path);
-	}
-
-	const auto bitmap_size = (file_size + 7) / 8 + HASHLEN / 8;
+	const auto bitmap_size = (size + 7) / 8 + HASHLEN / 8;
 	if (cutpoint_bitmap) {
-		portable_aligned_free(cutpoint_bitmap);
+		aligned_free_64(cutpoint_bitmap);
 	}
-	cutpoint_bitmap = static_cast<uint8_t*>(portable_aligned_alloc(64, bitmap_size));
+	cutpoint_bitmap = static_cast<uint8_t*>(aligned_alloc_64(bitmap_size));
 	if (!cutpoint_bitmap) {
 		printf("Error: allocate breakpoint bitmap failed, exit\n");
 		exit(2);
 	}
 	std::memset(cutpoint_bitmap, 0, bitmap_size);
 
-	using aligned_buffer = std::unique_ptr<unsigned char, decltype(&portable_aligned_free)>;
-	aligned_buffer file_data_owner(
-		static_cast<unsigned char*>(portable_aligned_alloc(64, file_size)),
-		&portable_aligned_free
-	);
-	if (!file_data_owner) {
-		printf("Error: allocate aligned file buffer failed, exit\n");
-		exit(2);
-	}
-	unsigned char* const file_data = file_data_owner.get();
-	if (!read_exact(file_ptr, reinterpret_cast<char*>(file_data), file_size)) {
-		throw std::runtime_error("Failed to read complete file: " + file_path);
-	}
-
 	auto begin_chunking = std::chrono::high_resolution_clock::now();
 	// The configured mask is stored as a 64-bit high-bit mask. The 32-bit
 	// implementation uses its upper half; 64-bit Gear consumes it directly.
 	const uint32_t avg_mask32 = static_cast<uint32_t>(mask >> 32);
 	if (use_64bit_gear) {
-		phase_one64(mask, min_block_size, file_data, file_size, cutpoint_bitmap);
+		phase_one64(mask, min_block_size, data, size, cutpoint_bitmap);
 	} else {
-		phase_one32(avg_mask32, min_block_size, file_data, file_size, cutpoint_bitmap);
+		phase_one32(avg_mask32, min_block_size, data, size, cutpoint_bitmap);
 	}
 	auto end_chunking = std::chrono::high_resolution_clock::now();
 	total_time_chunking += (end_chunking - begin_chunking);
 
 	std::memset(&cb, 0, sizeof(chunk_boundary));
-	std::vector<std::string> hashes{};
 	uint64_t prev_cut_offset = cb.right;
-	while (next_chunk(min_block_size, max_block_size, file_size, cb, SIMD_Mode::NONE, cutpoint_bitmap)) {
+	while (next_chunk(min_block_size, max_block_size, size, cb, SIMD_Mode::NONE, cutpoint_bitmap)) {
 #ifndef NDEBUG
 		// DEBUG: serially check next chunk size, crash if there is a mismatch
 		auto debug_curr_pos = prev_cut_offset;
 		if (use_64bit_gear) {
 			uint64_t hash = 0;
-			for (; debug_curr_pos < file_size; debug_curr_pos++) {
-				hash = gear_common::roll(hash, file_data[debug_curr_pos]);
+			for (; debug_curr_pos < size; debug_curr_pos++) {
+				hash = gear_common::roll(hash, data[debug_curr_pos]);
 				if (!(hash & mask) && (debug_curr_pos - prev_cut_offset >= min_block_size)) {
 					break;
 				}
@@ -1770,8 +1751,8 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 			}
 		} else {
 			uint32_t hash = 0;
-			for (; debug_curr_pos < file_size; debug_curr_pos++) {
-				hash = gear_common::roll(hash, file_data[debug_curr_pos]);
+			for (; debug_curr_pos < size; debug_curr_pos++) {
+				hash = gear_common::roll(hash, data[debug_curr_pos]);
 				if (!(hash & avg_mask32) && (debug_curr_pos - prev_cut_offset >= min_block_size)) {
 					break;
 				}
@@ -1794,7 +1775,7 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 #endif
 
 		File_Chunk new_chunk{ chunk_size };
-		memcpy(new_chunk.get_data(), file_data + prev_cut_offset, chunk_size);
+		memcpy(new_chunk.get_data(), data + prev_cut_offset, chunk_size);
 		if (!disable_hashing) {
 			auto begin_hashing = std::chrono::high_resolution_clock::now();
 			hash_method->hash_chunk(new_chunk);
@@ -1805,7 +1786,29 @@ std::vector<std::string> Gear_Chunking::chunk_file(std::string file_path) {
 
 		prev_cut_offset = cb.right;
 	}
-	return hashes;
+}
+
+void Gear_Chunking::chunk_stream(std::vector<std::string>& hashes,
+                                 std::istream& stream) {
+	if (simd_mode == SIMD_Mode::NONE) {
+		Chunking_Technique::chunk_stream(hashes, stream);
+		return;
+	}
+
+	const uint64_t size = get_file_size(&stream);
+	using aligned_buffer = std::unique_ptr<unsigned char, decltype(&aligned_free_64)>;
+	aligned_buffer data(
+		static_cast<unsigned char*>(aligned_alloc_64(size)),
+		&aligned_free_64
+	);
+	if (!data && size != 0) {
+		printf("Error: allocate aligned file buffer failed, exit\n");
+		exit(2);
+	}
+	if (!read_exact(stream, reinterpret_cast<char*>(data.get()), size)) {
+		throw std::runtime_error("Failed to read complete stream");
+	}
+	chunk_buffer(hashes, data.get(), size);
 }
 
 uint64_t Gear_Chunking::find_cutpoint(char* data, uint64_t size) {

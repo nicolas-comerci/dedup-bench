@@ -107,6 +107,21 @@ class Chunking_Technique{
          */
         virtual void chunk_stream(std::vector<std::string>& hashes, std::istream& stream);
 
+        /**
+         * @brief Chunk data that is already materialized in a contiguous buffer.
+         *
+         * Used for in-memory datasets (e.g. decompressed .xz) so that a
+         * chunker can process the buffer directly without an extra copy. The
+         * default implementation reuses chunk_stream() over a non-owning view
+         * of the buffer; whole-file/windowed SIMD chunkers override it.
+         *
+         * @param hashes: Output vector to append the chunk hashes to
+         * @param data: Pointer to the data to chunk (not owned by this object)
+         * @param size: Number of bytes in `data`
+         */
+        virtual void chunk_buffer(std::vector<std::string>& hashes,
+                                  const unsigned char* data, uint64_t size);
+
         virtual ~Chunking_Technique() {};
 
         /**

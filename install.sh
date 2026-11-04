@@ -31,6 +31,7 @@ if $is_windows; then
         mingw-w64-ucrt-x86_64-gcc \
         mingw-w64-ucrt-x86_64-openssl \
         mingw-w64-ucrt-x86_64-xxhash \
+        mingw-w64-ucrt-x86_64-xz \
         mingw-w64-ucrt-x86_64-python \
         mingw-w64-ucrt-x86_64-python-matplotlib \
         mingw-w64-ucrt-x86_64-python-seaborn || {
@@ -52,7 +53,7 @@ else
         exit 1
     fi
     sudo apt update
-    sudo apt -y install build-essential libssl-dev libxxhash-dev python3 python3-pip python3-matplotlib python3-seaborn
+    sudo apt -y install build-essential libssl-dev libxxhash-dev liblzma-dev python3 python3-pip python3-matplotlib python3-seaborn
 fi
 
 choice=0

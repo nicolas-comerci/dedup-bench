@@ -68,7 +68,18 @@ class Gear_Chunking : public virtual Chunking_Technique {
      * @param data Data stream to chunk.
      * @return A vector of File_Chuncks
      */
-    std::vector<std::string> chunk_file(std::string file_path) override;
+     std::vector<std::string> chunk_file(std::string file_path) override;
+
+     /**
+      * @brief Chunk an already-materialized buffer. For SIMD modes this runs
+      * the whole-file SS-CDC pass directly on `data` (no extra copy); for the
+      * serial mode it falls back to the base streaming implementation.
+      */
+      void chunk_buffer(std::vector<std::string>& hashes,
+                        const unsigned char* data, uint64_t size) override;
+
+      void chunk_stream(std::vector<std::string>& hashes,
+                        std::istream& stream) override;
 };
 
 #endif
